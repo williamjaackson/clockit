@@ -272,6 +272,68 @@ describe("ProviderSkillOverlay", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("switches a global skill off under every path a provider can report", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.realPath(
+        yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-skill-overlay-global-" }),
+      );
+      const canonical = path.join(root, "t3/skills/review-folder");
+      yield* fileSystem.makeDirectory(canonical, { recursive: true });
+      yield* fileSystem.writeFileString(
+        path.join(canonical, "SKILL.md"),
+        "---\nname: review\n---\n",
+      );
+      const codexAlias = path.join(root, "home/.codex/skills/review-folder");
+      yield* fileSystem.makeDirectory(path.dirname(codexAlias), { recursive: true });
+      yield* fileSystem.symlink(canonical, codexAlias);
+
+      const prepared = yield* prepareSkillOverlay({
+        projectRoot: path.join(root, "repo"),
+        privateRoot: path.join(root, "private-root"),
+        skillRoot: null,
+        skills: [],
+        suppressedRepoSkills: [
+          {
+            name: "review",
+            folderName: "review-folder",
+            path: canonical,
+            aliases: [codexAlias],
+            reason: "disabled",
+          },
+        ],
+        instructions: {
+          mode: "inherit",
+          content: null,
+          path: path.join(root, "private-root/AGENTS.md"),
+          globalInstructionsEnabled: true,
+        },
+        provenance: { manifestPath: path.join(root, "private-root/manifest.json") },
+      });
+
+      assert.deepEqual(codexSkillOverlayThreadConfig(prepared), {
+        "skills.config": [
+          { path: path.join(canonical, "SKILL.md"), enabled: false },
+          { path: path.join(codexAlias, "SKILL.md"), enabled: false },
+        ],
+      });
+      const claude = claudeSkillOverlayQuery(prepared, path.join(root, "home/.claude"), path);
+      assert.deepEqual(claude._tag === "Applied" ? claude.settings : undefined, {
+        skillOverrides: { review: "off", "review-folder": "off" },
+      });
+      // Codex reports the skill under its link path here; it still lists as off.
+      assert.deepEqual(
+        applySkillOverlayToCatalog(
+          [{ name: "review", path: path.join(codexAlias, "SKILL.md"), enabled: true }],
+          prepared,
+          "codex",
+        ).map(({ enabled }) => enabled),
+        [false],
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("fails with an actionable error when private settings are unreadable", () =>
     Effect.gen(function* () {
       const resolver = makeSkillOverlayResolver(

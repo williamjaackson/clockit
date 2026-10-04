@@ -4,7 +4,12 @@ import type {
   SkillScope,
   SkillsSnapshot,
 } from "@t3tools/contracts";
-import { providerDisplayName } from "@t3tools/client-runtime/state/skills";
+import {
+  formatProviderList,
+  providerDisplayName,
+  skillAgentProviders,
+  unsupportedSkillProviders,
+} from "@t3tools/client-runtime/state/skills";
 import { useState } from "react";
 
 import { skillsEnvironment } from "../../state/skills";
@@ -16,7 +21,7 @@ import { confirmSkillsAction, runSkillsCommand } from "./skillsCommands";
 
 const KIND_LABEL: Record<SkillRecoveryEntry["kind"], string> = {
   archivedSkill: "Archived skill",
-  replacedOriginal: "Replaced by a link",
+  replacedOriginal: "Moved aside by T3",
 };
 
 export function SkillsRecovery(props: {
@@ -44,7 +49,7 @@ export function SkillsRecovery(props: {
       title: `Restored ${entry.name}`,
       description:
         result.skippedLinks.length > 0
-          ? `Some links were not restored because something else is at ${result.skippedLinks.join(", ")}.`
+          ? `Some providers were not turned back on because something else now uses ${result.skippedLinks.join(", ")}.`
           : result.restoredPath,
     });
   };
@@ -69,7 +74,8 @@ export function SkillsRecovery(props: {
   if (props.snapshot.recovery.length === 0) {
     return (
       <p className="text-sm text-muted-foreground">
-        Archived skills and files that T3 moved aside to make room for a link show up here.
+        Archived skills, and originals T3 moved aside when it took over a skill or instructions
+        file, show up here.
       </p>
     );
   }
@@ -111,20 +117,38 @@ export function SkillsRecovery(props: {
   );
 }
 
-/** Where T3 looks for each provider's skills on this environment, and what it can't manage. */
+/**
+ * Where each agent turned on in T3's settings reads skills on this
+ * environment, and what T3 can't manage. Agents that read skills their own
+ * way get one line.
+ */
 export function SkillsProviders(props: { readonly snapshot: SkillsSnapshot }) {
-  if (props.snapshot.providers.length === 0) return null;
+  const agents = skillAgentProviders(props.snapshot);
+  const listed = props.snapshot.providers.filter((provider) =>
+    agents === null ? provider.scanned : agents.includes(provider.provider),
+  );
+  const unsupported = unsupportedSkillProviders(props.snapshot);
+  if (listed.length === 0 && unsupported.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No agent that reads skill folders is turned on. Turn one on in Settings, Providers.
+      </p>
+    );
+  }
   return (
-    <section className="flex flex-col gap-2">
-      <h3 className="text-sm font-medium">Providers</h3>
+    <section className="flex flex-col gap-3">
+      {unsupported.length > 0 ? (
+        <p className="text-xs text-muted-foreground">
+          {formatProviderList(unsupported)}{" "}
+          {unsupported.length === 1 ? "reads skills its own way" : "read skills their own way"}, so
+          T3 can't add skills there.
+        </p>
+      ) : null}
       <ul className="flex flex-col gap-3">
-        {props.snapshot.providers.map((provider) => (
+        {listed.map((provider) => (
           <li key={provider.provider} className="flex min-w-0 flex-col gap-0.5 text-xs">
             <span className="text-sm text-foreground">
               {providerDisplayName(provider.provider)}
-              {provider.scanned ? null : (
-                <span className="text-muted-foreground"> · reported by the provider</span>
-              )}
             </span>
             {provider.globalRoots.map((root) => (
               <span key={root} className="break-all text-muted-foreground">

@@ -6,9 +6,11 @@
  * module turns that into what Claude Code and Codex consume, without writing
  * to the repository or to any provider config file:
  *
- * - Repository skills the user disabled are switched off natively: Claude Code
- *   by folder name (and frontmatter name) in flag-level `skillOverrides`,
- *   Codex by SKILL.md path in the thread's `skills.config`. Every private
+ * - Repository skills and global library skills the user disabled for the
+ *   project are switched off natively: Claude Code by folder name (and
+ *   frontmatter name) in flag-level `skillOverrides`, Codex by SKILL.md path
+ *   in the thread's `skills.config`, at the library copy and at every provider
+ *   path that links to it, since Codex may report either. Every private
  *   skill's invocation name is switched off too, by name in both, so a private
  *   copy is the only one the agent sees. A name rule also hides a user-level
  *   skill of that name.
@@ -78,7 +80,11 @@ export interface PreparedSkillOverlay {
   readonly key: string;
   readonly projectRoot: string;
   readonly skills: ReadonlyArray<OverlaySkill>;
-  /** Repository skills the user disabled, resolved through symlinks when present. */
+  /**
+   * Native skills the user disabled for this project, resolved through
+   * symlinks when present. A global library skill appears once per path a
+   * provider can report it under.
+   */
   readonly disabledRepoSkills: ReadonlyArray<{
     /** Invocation name. */
     readonly name: string;
@@ -179,12 +185,12 @@ export const prepareSkillOverlay = Effect.fn("prepareSkillOverlay")(function* (
     // Codex reports canonical paths; a missing folder keeps its stated path.
     const stated = entry.path;
     const directory = yield* fileSystem.realPath(stated).pipe(Effect.orElseSucceed(() => stated));
-    disabledRepoSkills.push({
-      name: entry.name,
-      folderName: entry.folderName ?? path.basename(stated),
-      directory,
-      skillFile: path.join(directory, "SKILL.md"),
-    });
+    const folderName = entry.folderName ?? path.basename(stated);
+    for (const candidate of [directory, ...(entry.aliases ?? [])]) {
+      const skillFile = path.join(candidate, "SKILL.md");
+      if (disabledRepoSkills.some((skill) => skill.skillFile === skillFile)) continue;
+      disabledRepoSkills.push({ name: entry.name, folderName, directory: candidate, skillFile });
+    }
   }
   const replaced = {
     names: [...replacedNames].toSorted(),

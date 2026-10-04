@@ -31,6 +31,7 @@ const ENV_A = EnvironmentId.make("skills-a");
 const ENV_B = EnvironmentId.make("skills-b");
 const GLOBAL: SkillScope = {};
 const SHARED: SkillScope = { projectPath: "/repo", mode: "shared" };
+const LOCAL: SkillScope = { projectPath: "/repo", mode: "local" };
 
 /** A snapshot told apart by its only warning. */
 function snapshot(label: string): SkillsSnapshot {
@@ -79,6 +80,25 @@ const makeHarness = Effect.fn("SkillsAtomsTest.makeHarness")(function* () {
         [WS_METHODS.skillsSetEnabled]: (input: { readonly scope: SkillScope }) =>
           answer(environmentId, "setEnabled", input.scope).pipe(
             Effect.map((next) => ({ skippedLinks: [], snapshot: next })),
+          ),
+        [WS_METHODS.skillsSetEnabledMany]: (input: { readonly scope: SkillScope }) =>
+          answer(environmentId, "setEnabledMany", input.scope).pipe(
+            Effect.map((next) => ({ skippedLinks: [], snapshot: next })),
+          ),
+        [WS_METHODS.skillsResetProject]: (input: { readonly projectPath: string }) =>
+          answer(environmentId, "resetProject", { projectPath: input.projectPath }).pipe(
+            Effect.map((next) => ({ inherited: [], repository: [], snapshot: next })),
+          ),
+        [WS_METHODS.skillsRelease]: (input: { readonly name: string; readonly dryRun?: boolean }) =>
+          answer(environmentId, input.dryRun ? "releasePreview" : "release", undefined).pipe(
+            Effect.map((next) => ({
+              name: input.name,
+              destination: `/home/me/.agents/skills/${input.name}`,
+              wasEnabled: true,
+              relinked: [],
+              released: input.dryRun !== true,
+              snapshot: next,
+            })),
           ),
         [WS_METHODS.skillsLink]: (input: { readonly scope?: SkillScope }) =>
           answer(environmentId, "link", input.scope).pipe(
@@ -275,6 +295,65 @@ it.effect("mutations run one at a time per environment and land in order", () =>
       yield* harness.reply(toggle, "disabled");
       yield* Effect.promise(() => disabling);
       yield* harness.settledOn(target, "disabled");
+    }),
+  ),
+);
+
+it.effect("a release preview queues behind mutations and never replaces the view", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const target = { environmentId: ENV_A, scope: GLOBAL };
+      yield* harness.mount(target);
+      yield* harness.reply(yield* Queue.take(harness.calls), "initial");
+      yield* harness.settledOn(target, "initial");
+
+      const disabling = harness.atoms.setEnabled.run(harness.registry, {
+        environmentId: ENV_A,
+        input: { scope: GLOBAL, skill: { name: "review" }, enabled: false },
+      });
+      const previewing = harness.atoms.releasePreview.run(harness.registry, {
+        environmentId: ENV_A,
+        input: { name: "review", destination: "/elsewhere/review" },
+      });
+      const toggle = yield* Queue.take(harness.calls);
+      expect(toggle.method).toBe("setEnabled");
+      expect(yield* Queue.size(harness.calls)).toBe(0);
+      yield* harness.reply(toggle, "disabled");
+      yield* Effect.promise(() => disabling);
+
+      const preview = yield* Queue.take(harness.calls);
+      expect(preview.method).toBe("releasePreview");
+      yield* harness.reply(preview, "preview");
+      const result = yield* Effect.promise(() => previewing);
+      expect(result._tag).toBe("Success");
+      expect(yield* harness.settled(target)).toBe("disabled");
+    }),
+  ),
+);
+
+it.effect("a project reset lands on the project's private view only", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const local = { environmentId: ENV_A, scope: LOCAL };
+      const shared = { environmentId: ENV_A, scope: SHARED };
+      yield* harness.mount(local);
+      yield* harness.mount(shared);
+      for (let index = 0; index < 2; index += 1) {
+        const call = yield* Queue.take(harness.calls);
+        yield* harness.reply(call, `scan:${call.scope.mode}`);
+      }
+      yield* harness.settledOn(local, "scan:local");
+
+      const resetting = harness.atoms.resetProject.run(harness.registry, {
+        environmentId: ENV_A,
+        input: { projectPath: "/repo", sections: ["inherited"] },
+      });
+      yield* harness.reply(yield* Queue.take(harness.calls), "reset");
+      yield* Effect.promise(() => resetting);
+      yield* harness.settledOn(local, "reset");
+      expect(yield* harness.settled(shared)).toBe("scan:shared");
     }),
   ),
 );

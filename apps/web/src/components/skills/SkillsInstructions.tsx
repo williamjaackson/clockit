@@ -9,23 +9,24 @@ import type {
 } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
+  instructionLinkTargets,
   isSkillsRevisionConflict,
   providerDisplayName,
-  sharedProfileNotice,
   skillsFailureMessage,
 } from "@t3tools/client-runtime/state/skills";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { skillsEnvironment } from "../../state/skills";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { SettingsGroup } from "../settings/SettingsGroup";
 import { Alert, AlertDescription } from "../ui/alert";
-import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Skeleton } from "../ui/skeleton";
 import { Toggle, ToggleGroup } from "../ui/toggle-group";
 import { SkillFileEditor, type SkillFileSaveOutcome } from "./SkillFileEditor";
-import { SkillLinkTargets } from "./SkillLinkTargets";
+import { SkillProviderSwitches } from "./SkillProviderSwitches";
+import { SkillsDisclosure, SkillsPathRow, SkillsSectionTitle } from "./SkillsDisclosure";
 import { confirmSkillsAction, runSkillsCommand } from "./skillsCommands";
 
 const INSTRUCTION_MODES: ReadonlyArray<{
@@ -139,7 +140,7 @@ export function SkillsInstructions(props: {
     if (replacing) {
       if (
         !(await confirmSkillsAction(
-          `Replace your instructions with ${source.path}?\nThe current text at ${snapshot.instructions.canonicalPath} is overwritten.`,
+          `Replace your instructions with the text of ${source.path}?\nYour current instructions are overwritten.`,
           "destructive",
         ))
       ) {
@@ -177,13 +178,52 @@ export function SkillsInstructions(props: {
   };
 
   const mode = snapshot.instructions.mode ?? "inherit";
-  const profileNotice = sharedProfileNotice(snapshot.scope);
+  const documentPath =
+    documentState.status === "ready"
+      ? documentState.document.path
+      : snapshot.instructions.canonicalPath;
+  const filesByPath = new Map(
+    snapshot.instructions.files.map((candidate) => [candidate.path, candidate]),
+  );
+  const projectRoot = snapshot.scope.projectRoot;
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
+      {!projectPrivate && snapshot.instructions.links.length > 0 ? (
+        <section className="flex flex-col gap-2">
+          <SkillsSectionTitle>Use with</SkillsSectionTitle>
+          <p className="text-xs text-muted-foreground">
+            {shared
+              ? "Claude Code reads CLAUDE.md, not AGENTS.md. Turn it on to have CLAUDE.md follow AGENTS.md in the repository."
+              : "Providers you turn on read these instructions instead of their own file. A provider that already has its own file keeps it until you replace it or import its text."}
+          </p>
+          <SkillProviderSwitches
+            environmentId={environmentId}
+            scope={scope}
+            subject={{ type: "instructions" }}
+            subjectLabel={shared ? "AGENTS.md" : "your instructions"}
+            links={snapshot.instructions.links}
+            linkTargets={instructionLinkTargets(snapshot.instructions)}
+            renderExtra={(row) => {
+              const source = filesByPath.get(row.status.path);
+              return !shared && row.action === "replace" && source?.exists ? (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  disabled={pending}
+                  onClick={() => void importFile(source)}
+                >
+                  Import text
+                </Button>
+              ) : null;
+            }}
+          />
+        </section>
+      ) : null}
+
       {projectPrivate ? (
         <section className="flex flex-col gap-2">
-          <h3 className="text-sm font-medium">How your private instructions apply</h3>
+          <SkillsSectionTitle>How your private instructions apply</SkillsSectionTitle>
           <Select
             value={mode}
             disabled={pending}
@@ -208,24 +248,18 @@ export function SkillsInstructions(props: {
           <p className="text-xs text-muted-foreground">
             {INSTRUCTION_MODES.find((option) => option.value === mode)?.description}
           </p>
-          {profileNotice !== null ? (
-            <p className="break-all text-xs text-muted-foreground">{profileNotice}</p>
-          ) : null}
         </section>
       ) : null}
 
       <section className="flex flex-col gap-2">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex min-w-0 flex-col">
-            <h3 className="text-sm font-medium">
-              {shared ? "Repository instructions" : "Instructions"}
-            </h3>
-            <span className="break-all text-xs text-muted-foreground">
-              {documentState.status === "ready"
-                ? documentState.document.path
-                : snapshot.instructions.canonicalPath}
-            </span>
-          </div>
+        <div className="flex min-h-7 flex-wrap items-center justify-between gap-2">
+          <SkillsSectionTitle>
+            {shared
+              ? "Repository instructions"
+              : projectPrivate
+                ? "Private instructions"
+                : "Global instructions"}
+          </SkillsSectionTitle>
           {shared ? (
             <ToggleGroup
               aria-label="Instruction file"
@@ -274,65 +308,57 @@ export function SkillsInstructions(props: {
         )}
       </section>
 
-      {!shared && snapshot.instructions.files.length > 0 ? (
+      {projectPrivate && snapshot.instructions.files.some((candidate) => candidate.exists) ? (
         <section className="flex flex-col gap-2">
-          <h3 className="text-sm font-medium">
-            {projectPrivate ? "Repository files" : "Provider files"}
-          </h3>
-          <ul className="flex flex-col divide-y divide-border rounded-lg border">
-            {snapshot.instructions.files.map((candidate) => (
-              <li key={candidate.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 p-2.5">
-                <div className="flex min-w-0 flex-1 flex-col">
-                  <span className="text-sm font-medium">
-                    {candidate.providers.map(providerDisplayName).join(", ") || "Repository"}
-                  </span>
-                  <span className="break-all text-xs text-muted-foreground">{candidate.path}</span>
-                </div>
-                {candidate.ownedLink ? (
-                  <Badge variant="success">Linked</Badge>
-                ) : !candidate.exists ? (
-                  <Badge variant="outline">Missing</Badge>
-                ) : null}
-                {candidate.exists && !candidate.ownedLink ? (
+          <SkillsSectionTitle>Start from a repository file</SkillsSectionTitle>
+          <SettingsGroup>
+            {snapshot.instructions.files
+              .filter((candidate) => candidate.exists)
+              .map((candidate) => (
+                <div
+                  key={candidate.id}
+                  className="flex min-w-0 items-center gap-3 px-3 py-2.5 sm:px-4"
+                >
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <span className="break-all text-sm font-medium">
+                      {projectRoot !== undefined && candidate.path.startsWith(projectRoot)
+                        ? candidate.path.slice(projectRoot.length + 1)
+                        : candidate.path}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      Read by {candidate.providers.map(providerDisplayName).join(", ")}
+                    </span>
+                  </div>
                   <Button
                     size="xs"
                     variant="outline"
                     disabled={pending}
                     onClick={() => void importFile(candidate)}
                   >
-                    Import
+                    Import text
                   </Button>
-                ) : null}
-              </li>
-            ))}
-          </ul>
+                </div>
+              ))}
+          </SettingsGroup>
         </section>
       ) : null}
 
-      {!projectPrivate && snapshot.instructions.links.length > 0 ? (
-        <section className="flex flex-col gap-2">
-          <h3 className="text-sm font-medium">{shared ? "Repository links" : "Provider links"}</h3>
-          <p className="text-xs text-muted-foreground">
-            {shared
-              ? "Claude Code reads CLAUDE.md, not AGENTS.md. Linking turns CLAUDE.md into a symlink to AGENTS.md in the repository, so both read the same file. Nothing is linked until you ask."
-              : "Link a provider's instruction file to these instructions so every provider reads the same text."}
-          </p>
-          <SkillLinkTargets
-            environmentId={environmentId}
-            scope={scope}
-            subject={{ type: "instructions" }}
-            subjectLabel={shared ? "AGENTS.md" : "your instructions"}
-            links={snapshot.instructions.links}
-            linkTargets={snapshot.instructions.links.map((status) => ({
-              id: status.targetId,
-              path: status.path,
-              providers:
-                snapshot.instructions.files.find((candidate) => candidate.path === status.path)
-                  ?.providers ?? [],
-            }))}
+      <SkillsDisclosure title="Details">
+        <SkillsPathRow label={shared ? "Editing" : "Stored in"} path={documentPath} />
+        {snapshot.instructions.files.map((candidate) => (
+          <SkillsPathRow
+            key={candidate.id}
+            label={`${candidate.providers.map(providerDisplayName).join(", ") || "Repository"}${
+              candidate.ownedLink
+                ? ", reads these instructions"
+                : candidate.exists
+                  ? ", has its own file"
+                  : ", no file yet"
+            }`}
+            path={candidate.path}
           />
-        </section>
-      ) : null}
+        ))}
+      </SkillsDisclosure>
     </div>
   );
 }

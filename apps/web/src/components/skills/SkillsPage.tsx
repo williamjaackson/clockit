@@ -6,35 +6,54 @@ import type {
   SkillsSnapshot,
 } from "@t3tools/contracts";
 import {
+  discoverableSkills,
   EMPTY_SKILLS_VIEW_ATOM,
-  filterSkillEntries,
   findScopeLibraryEntry,
   GLOBAL_SKILLS_SCOPE,
+  PRIVATE_PROJECT_SUMMARY,
   PRIVATE_PROJECT_SUPPORT_NOTICE,
+  providerSyncNames,
+  SHARED_PROJECT_SUMMARY,
   sharedProfileNotice,
+  skillBulkEntries,
+  skillEntryFilters,
   skillScope,
+  skillSections,
   skillsScopeKey,
   type SkillEntryFilter,
+  type SkillSection,
   type SkillsScopeSelection,
   skillsFailureMessage,
 } from "@t3tools/client-runtime/state/skills";
 import { useBlocker } from "@tanstack/react-router";
 import { Atom } from "effect/unstable/reactivity";
-import { PlusIcon } from "lucide-react";
+import { ChevronLeftIcon, PlusIcon } from "lucide-react";
 import { useCallback, useContext, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { isElectron } from "../../env";
+import { cn } from "../../lib/utils";
 import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environments";
 import { environmentProjects } from "../../state/projects";
 import { skillsEnvironment } from "../../state/skills";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "../ui/alert";
 import { Button } from "../ui/button";
+import {
+  Dialog,
+  DialogDescription,
+  DialogHeader,
+  DialogPanel,
+  DialogPopup,
+  DialogTitle,
+} from "../ui/dialog";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../ui/empty";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { RefreshIcon } from "../ui/refresh-icon";
 import { ScrollArea } from "../ui/scroll-area";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { SidebarInset } from "../ui/sidebar";
 import { Skeleton } from "../ui/skeleton";
+import { toastManager } from "../ui/toast";
 import { Toggle, ToggleGroup } from "../ui/toggle-group";
 import {
   WorkspaceBreadcrumb,
@@ -44,11 +63,17 @@ import {
 import { WorkspacePageContainer } from "../WorkspacePageContainer";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { SkillDetail } from "./SkillDetail";
-import { ImportSkillDialog, NewSkillDialog } from "./SkillDialogs";
+import {
+  DiscoverSkillsDialog,
+  ImportSkillDialog,
+  NewSkillDialog,
+  ReleaseSkillDialog,
+} from "./SkillDialogs";
+import { SkillsDisclosure, SkillsPathRow } from "./SkillsDisclosure";
 import { SkillsInstructions } from "./SkillsInstructions";
 import { SkillsFilterBar, SkillsList } from "./SkillsList";
 import { SkillsProviders, SkillsRecovery } from "./SkillsRecovery";
-import { confirmSkillsAction } from "./skillsCommands";
+import { confirmSkillsAction, reportSkippedLinks, runSkillsCommand } from "./skillsCommands";
 import { readSharedModeState, saveSharedMode, sharedModeKey } from "./skillsSharedMode";
 
 type SkillsTab = "skills" | "instructions" | "recovery";
@@ -146,10 +171,33 @@ export function SkillsPage() {
 
   const [tab, setTab] = useState<SkillsTab>("skills");
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<SkillEntryFilter>("all");
+  const [chosenFilter, setFilter] = useState<SkillEntryFilter>("all");
+  const [showOffInMySkills, setShowOffInMySkills] = useState(false);
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
   const [newSkillOpen, setNewSkillOpen] = useState(false);
+  const [discoverOpen, setDiscoverOpen] = useState(false);
   const [importEntry, setImportEntry] = useState<SkillEntry | null>(null);
+  const [releaseEntry, setReleaseEntry] = useState<SkillEntry | null>(null);
+  const [providersOpen, setProvidersOpen] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  // Switch requests in flight, by scope and entry, with the value each asks for.
+  const [pendingToggles, setPendingToggles] = useState<ReadonlyMap<string, boolean>>(new Map());
+  const filter =
+    snapshot !== null &&
+    skillEntryFilters(snapshot.scope).some((option) => option.value === chosenFilter)
+      ? chosenFilter
+      : "all";
+
+  const setEnabledCommand = useAtomCommand(skillsEnvironment.setEnabled, { reportFailure: false });
+  const setEnabledManyCommand = useAtomCommand(skillsEnvironment.setEnabledMany, {
+    reportFailure: false,
+  });
+  const resetProjectCommand = useAtomCommand(skillsEnvironment.resetProject, {
+    reportFailure: false,
+  });
+  const syncProvidersCommand = useAtomCommand(skillsEnvironment.syncProviders, {
+    reportFailure: false,
+  });
 
   const liveEntry = snapshot?.entries.find((entry) => entry.id === selectedEntryId) ?? null;
   const selectedEntry =
@@ -200,13 +248,27 @@ export function SkillsPage() {
       setChosenEnvironmentId(next);
       setProjectPath(null);
       setSelectedEntryId(null);
+      setShowOffInMySkills(false);
     })();
 
   const changeProject = (next: string | null) =>
     guarded(() => {
       setProjectPath(next);
       setSelectedEntryId(null);
+      setShowOffInMySkills(false);
     })();
+
+  /** Opens a project's inherited skill where it can be edited: in My skills. */
+  const editInMySkills = (entry: SkillEntry) =>
+    void guarded(() => {
+      setProjectPath(null);
+      setSelectedEntryId(`managed:${entry.name}`);
+      setQuery("");
+      setFilter("all");
+      setShowOffInMySkills(false);
+    })();
+
+  const openMySkills = () => void changeProject(null);
 
   const changeShared = async (nextShared: boolean) => {
     if (project === null || projectModeKey === null || nextShared === shared) return;
@@ -219,6 +281,7 @@ export function SkillsPage() {
     if (!(await discardDraft())) return;
     setSharedModeState(saveSharedMode(sharedModeState, projectModeKey, nextShared));
     setSelectedEntryId(null);
+    setShowOffInMySkills(false);
   };
 
   /** Rescans the scope and reads the open file again. */
@@ -230,14 +293,130 @@ export function SkillsPage() {
     })();
   };
 
-  const visibleEntries = useMemo(
-    () => (snapshot === null ? [] : filterSkillEntries(snapshot.entries, { query, filter })),
-    [filter, query, snapshot],
+  const sections = useMemo(
+    () => (snapshot === null ? [] : skillSections(snapshot, { query, filter, showOffInMySkills })),
+    [filter, query, showOffInMySkills, snapshot],
   );
+  const discoverable = useMemo(
+    () => (snapshot === null ? [] : discoverableSkills(snapshot)),
+    [snapshot],
+  );
+  const syncNames = useMemo(
+    () => (snapshot === null ? [] : providerSyncNames(snapshot)),
+    [snapshot],
+  );
+  const pendingHere = useMemo(() => {
+    const prefix = `${scopeKey}\n`;
+    return new Map(
+      [...pendingToggles]
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([key, value]) => [key.slice(prefix.length), value] as const),
+    );
+  }, [pendingToggles, scopeKey]);
+  const canSelectEntry = (entryId: string) =>
+    sections.some((section) => section.all.some((entry) => entry.id === entryId));
   const selectEntry = (entryId: string) => {
     if (entryId === selectedEntryId) return;
     void guarded(() => setSelectedEntryId(entryId))();
   };
+
+  const markPending = (key: string, ids: ReadonlyArray<string>, value: boolean | null) =>
+    setPendingToggles((current) => {
+      const next = new Map(current);
+      for (const id of ids) {
+        if (value === null) next.delete(`${key}\n${id}`);
+        else next.set(`${key}\n${id}`, value);
+      }
+      return next;
+    });
+
+  /**
+   * Switches skills in the current scope, one or a section at a time. A T3
+   * skill moves folders when switched, so a draft of the open one is dropped
+   * first and its file read again afterwards. Project switches on inherited
+   * and repository skills touch no files.
+   */
+  const switchSkills = async (entries: ReadonlyArray<SkillEntry>, enabled: boolean) => {
+    const [first, ...rest] = entries;
+    if (environmentId === null || first === undefined) return;
+    const ids = entries.map((entry) => entry.id);
+    if (ids.some((id) => pendingHere.has(id))) return;
+    const movesOpenSkill =
+      selectedEntry !== null &&
+      ids.includes(selectedEntry.id) &&
+      selectedEntry.ownership === "managed" &&
+      !selectedEntry.id.startsWith("inherited:");
+    if (movesOpenSkill && !(await discardDraft())) return;
+    const key = scopeKey;
+    markPending(key, ids, enabled);
+    const failure = enabled ? "Could not turn skills on" : "Could not turn skills off";
+    const result = await runSkillsCommand(
+      rest.length === 0
+        ? setEnabledCommand({
+            environmentId,
+            input: { scope, skill: { entryId: first.id }, enabled },
+          })
+        : setEnabledManyCommand({
+            environmentId,
+            input: {
+              scope,
+              skills: [{ entryId: first.id }, ...rest.map((entry) => ({ entryId: entry.id }))],
+              enabled,
+            },
+          }),
+      failure,
+    );
+    markPending(key, ids, null);
+    if (movesOpenSkill && !dirtyRef.current) setEditorEpoch((epoch) => epoch + 1);
+    if (result !== null && result.skippedLinks.length > 0) {
+      toastManager.add({
+        type: "warning",
+        title: "Some agents didn't get the skill back",
+        description: `Something else now sits at ${result.skippedLinks.join(", ")}.`,
+      });
+    }
+  };
+
+  const toggleEntry = (entry: SkillEntry, enabled: boolean) => void switchSkills([entry], enabled);
+  const bulkToggle = (section: SkillSection, enabled: boolean) => {
+    if (snapshot === null) return;
+    void switchSkills(skillBulkEntries(section.all, snapshot.scope, enabled), enabled);
+  };
+
+  const resetSection = async (section: SkillSection) => {
+    if (environmentId === null || project === null) return;
+    if (section.id !== "inherited" && section.id !== "repository") return;
+    const confirmed = await confirmSkillsAction(
+      section.id === "inherited"
+        ? "Turn every My skills skill back on for this project?\nSkills that are off in My skills stay off. Private skills don't change."
+        : "Turn every repository skill back on for T3 agents?\nPrivate skills don't change.",
+    );
+    if (!confirmed) return;
+    await runSkillsCommand(
+      resetProjectCommand({
+        environmentId,
+        input: { projectPath: project.workspaceRoot, sections: [section.id] },
+      }),
+      "Could not reset the project's skills",
+    );
+  };
+
+  /** Adds My skills entries to enabled agents that lack them. Never removes or replaces anything. */
+  const syncProviders = async (names: ReadonlyArray<string>) => {
+    const [first, ...rest] = names;
+    if (environmentId === null || first === undefined || syncing) return;
+    setSyncing(true);
+    const result = await runSkillsCommand(
+      syncProvidersCommand({ environmentId, input: { names: [first, ...rest] } }),
+      "Could not add skills to every agent",
+    );
+    setSyncing(false);
+    if (result === null) return;
+    if (result.skippedLinks.length > 0) reportSkippedLinks(result.skippedLinks);
+    else toastManager.add({ type: "success", title: "Every agent you've turned on has them now" });
+  };
+
+  const openRelease = (entry: SkillEntry) => void guarded(() => setReleaseEntry(entry))();
   /**
    * Opens a skill a dialog just wrote, unless the page has since moved to
    * another environment or scope. `targetKey` is the scope the dialog wrote to.
@@ -308,10 +487,10 @@ export function SkillsPage() {
                   variant="ghost"
                   className="w-auto min-w-0"
                 >
-                  <SelectValue>{project?.title ?? "Global"}</SelectValue>
+                  <SelectValue>{project?.title ?? "My skills"}</SelectValue>
                 </SelectTrigger>
                 <SelectPopup alignItemWithTrigger={false}>
-                  <SelectItem value={GLOBAL_SCOPE_VALUE}>Global</SelectItem>
+                  <SelectItem value={GLOBAL_SCOPE_VALUE}>My skills</SelectItem>
                   {projects.map((candidate) => (
                     <SelectItem key={candidate.id} value={candidate.workspaceRoot}>
                       <span className="flex min-w-0 flex-col">
@@ -341,7 +520,7 @@ export function SkillsPage() {
     </div>
   );
 
-  const body = (() => {
+  const openStatus = (() => {
     if (environment === null || environmentId === null) {
       return (
         <Empty>
@@ -352,83 +531,57 @@ export function SkillsPage() {
         </Empty>
       );
     }
-    if (snapshot === null) {
-      if (!connected && !view.isLoading) {
-        return (
-          <Empty>
-            <EmptyHeader>
-              <EmptyTitle>{environment.label} is not connected</EmptyTitle>
-              <EmptyDescription>
-                Skills live on each environment. Reconnect it to manage them.
-              </EmptyDescription>
-            </EmptyHeader>
-          </Empty>
-        );
-      }
-      if (view.error !== null && !view.isLoading) {
-        return (
-          <Alert variant="error">
-            <AlertTitle>Could not read skills</AlertTitle>
-            <AlertDescription>{skillsFailureMessage(view.error)}</AlertDescription>
-            <AlertAction>
-              <Button size="xs" variant="outline" onClick={refresh}>
-                Try again
-              </Button>
-            </AlertAction>
-          </Alert>
-        );
-      }
+    if (snapshot !== null) return null;
+    if (!connected && !view.isLoading) {
       return (
-        <div className="flex flex-col gap-3">
-          <Skeleton className="h-9 w-full" />
-          <Skeleton className="h-48 w-full" />
-        </div>
+        <Empty>
+          <EmptyHeader>
+            <EmptyTitle>{environment.label} is not connected</EmptyTitle>
+            <EmptyDescription>
+              Skills live on each environment. Reconnect it to manage them.
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      );
+    }
+    if (view.error !== null && !view.isLoading) {
+      return (
+        <Alert variant="error">
+          <AlertTitle>Could not read skills</AlertTitle>
+          <AlertDescription>{skillsFailureMessage(view.error)}</AlertDescription>
+          <AlertAction>
+            <Button size="xs" variant="outline" onClick={refresh}>
+              Try again
+            </Button>
+          </AlertAction>
+        </Alert>
+      );
+    }
+    return (
+      <div className="flex flex-col gap-3">
+        <Skeleton className="h-9 w-full" />
+        <Skeleton className="h-48 w-full" />
+      </div>
+    );
+  })();
+
+  const content = (() => {
+    if (
+      openStatus !== null ||
+      environment === null ||
+      environmentId === null ||
+      snapshot === null
+    ) {
+      return (
+        <ScrollArea className="min-h-0 flex-1">
+          <WorkspacePageContainer width="expanded">{openStatus}</WorkspacePageContainer>
+        </ScrollArea>
       );
     }
 
-    return (
-      <>
-        {project !== null ? (
-          <section className="flex flex-col gap-3">
-            <ToggleGroup
-              aria-label="Where project changes go"
-              value={[shared ? "shared" : "local"]}
-              onValueChange={(next) => {
-                if (next[0] === "shared" || next[0] === "local") {
-                  void changeShared(next[0] === "shared");
-                }
-              }}
-            >
-              <Toggle value="local">Private to T3</Toggle>
-              <Toggle value="shared">Repository files</Toggle>
-            </ToggleGroup>
-            {shared ? (
-              <Alert variant="warning">
-                <AlertTitle>Edits files in the repository</AlertTitle>
-                <AlertDescription>
-                  <span className="break-all">
-                    {snapshot.scope.projectRoot ?? project.workspaceRoot}
-                  </span>
-                </AlertDescription>
-              </Alert>
-            ) : (
-              <Alert variant="info">
-                {profileNotice !== null ? (
-                  <AlertTitle>Inherited private settings</AlertTitle>
-                ) : null}
-                <AlertDescription>
-                  {profileNotice !== null ? (
-                    <span className="block break-all">{profileNotice}</span>
-                  ) : null}
-                  Stored outside the repository in{" "}
-                  <span className="break-all">{snapshot.scope.libraryPath}</span>.{" "}
-                  {PRIVATE_PROJECT_SUPPORT_NOTICE}
-                </AlertDescription>
-              </Alert>
-            )}
-          </section>
-        ) : null}
-
+    const detailOpen = selectedEntry !== null;
+    const toolbar = (
+      <WorkspacePageContainer width="expanded" className="shrink-0 gap-3 pb-4">
         {environmentGone || projectGone ? (
           <Alert variant="warning">
             <AlertTitle>
@@ -453,7 +606,7 @@ export function SkillsPage() {
           <Alert variant="warning">
             <AlertTitle>Some folders were not fully scanned</AlertTitle>
             <AlertDescription>
-              <ul className="flex flex-col gap-0.5">
+              <ul className="flex max-h-24 flex-col gap-0.5 overflow-y-auto">
                 {snapshot.warnings.map((warning) => (
                   <li key={warning} className="break-all">
                     {warning}
@@ -464,97 +617,256 @@ export function SkillsPage() {
           </Alert>
         ) : null}
 
-        <ToggleGroup
-          aria-label="Skills section"
-          value={[tab]}
-          onValueChange={(next) => {
-            const value = next[0];
-            if (
-              (value === "skills" || value === "instructions" || value === "recovery") &&
-              value !== tab
-            ) {
-              void guarded(() => setTab(value))();
-            }
-          }}
-        >
-          <Toggle value="skills">Skills</Toggle>
-          <Toggle value="instructions">Instructions</Toggle>
-          <Toggle value="recovery">
-            Recovery{snapshot.recovery.length > 0 ? ` (${snapshot.recovery.length})` : ""}
-          </Toggle>
-        </ToggleGroup>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <ToggleGroup
+            aria-label="Skills section"
+            value={[tab]}
+            onValueChange={(next) => {
+              const value = next[0];
+              if (
+                (value === "skills" || value === "instructions" || value === "recovery") &&
+                value !== tab
+              ) {
+                void guarded(() => setTab(value))();
+              }
+            }}
+          >
+            <Toggle value="skills">Skills</Toggle>
+            <Toggle value="instructions">Instructions</Toggle>
+            <Toggle value="recovery">
+              Recovery{snapshot.recovery.length > 0 ? ` (${snapshot.recovery.length})` : ""}
+            </Toggle>
+          </ToggleGroup>
+          {project !== null ? (
+            <ToggleGroup
+              aria-label="Where project changes go"
+              value={[shared ? "shared" : "local"]}
+              onValueChange={(next) => {
+                if (next[0] === "shared" || next[0] === "local") {
+                  void changeShared(next[0] === "shared");
+                }
+              }}
+            >
+              <Toggle value="local">Private to T3</Toggle>
+              <Toggle value="shared">Repository files</Toggle>
+            </ToggleGroup>
+          ) : null}
+        </div>
 
-        {tab === "skills" ? (
-          <section className="grid gap-6 lg:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
-            <div className="flex min-w-0 flex-col gap-3">
-              <div className="flex min-w-0 items-center gap-2">
-                <div className="min-w-0 flex-1">
-                  <SkillsFilterBar
-                    query={query}
-                    onQueryChange={setQuery}
-                    filter={filter}
-                    onFilterChange={setFilter}
-                  />
-                </div>
-                <Button size="icon-sm" aria-label="New skill" onClick={() => setNewSkillOpen(true)}>
-                  <PlusIcon />
+        {project !== null && shared ? (
+          <Alert variant="warning">
+            <AlertDescription>{SHARED_PROJECT_SUMMARY}</AlertDescription>
+          </Alert>
+        ) : project !== null ? (
+          <div className="flex flex-col gap-1">
+            <p className="text-xs text-muted-foreground">{PRIVATE_PROJECT_SUMMARY}</p>
+            {profileNotice !== null ? (
+              <p className="break-words text-xs text-warning-foreground">{profileNotice}</p>
+            ) : null}
+            <SkillsDisclosure title="How private changes work">
+              {/* Capped so an open disclosure never squeezes the skills list out of view. */}
+              <div className="flex max-h-40 flex-col gap-3 overflow-y-auto">
+                <p className="text-xs text-muted-foreground">{PRIVATE_PROJECT_SUPPORT_NOTICE}</p>
+                <SkillsPathRow label="Stored in" path={snapshot.scope.libraryPath} />
+              </div>
+            </SkillsDisclosure>
+          </div>
+        ) : null}
+      </WorkspacePageContainer>
+    );
+
+    const isGlobal = snapshot.scope.kind === "global";
+    const isPrivateProject = snapshot.scope.kind === "project" && snapshot.scope.mode !== "shared";
+    const listed = sections.reduce((count, section) => count + section.entries.length, 0);
+    const total = sections.reduce((count, section) => count + section.all.length, 0);
+    const listActions = {
+      selectedId: selectedEntry?.id ?? null,
+      onSelect: selectEntry,
+      pending: pendingHere,
+      onToggle: toggleEntry,
+      onBulk: bulkToggle,
+      onReset: (section: SkillSection) => void resetSection(section),
+      onShowOffInMySkills: () => setShowOffInMySkills(true),
+      onOpenMySkills: openMySkills,
+      showOffInMySkills,
+    };
+    const addButton = isGlobal ? (
+      <Menu>
+        <MenuTrigger render={<Button size="icon-sm" aria-label="Add skills" />}>
+          <PlusIcon />
+        </MenuTrigger>
+        <MenuPopup align="end">
+          <MenuItem onClick={() => setNewSkillOpen(true)}>New skill…</MenuItem>
+          <MenuItem onClick={() => setDiscoverOpen(true)}>
+            Manage existing skills…
+            {discoverable.length > 0 ? ` (${discoverable.length})` : ""}
+          </MenuItem>
+        </MenuPopup>
+      </Menu>
+    ) : (
+      <Button
+        size="icon-sm"
+        aria-label={isPrivateProject ? "New private skill" : "New skill"}
+        onClick={() => setNewSkillOpen(true)}
+      >
+        <PlusIcon />
+      </Button>
+    );
+
+    const skillsPane = (
+      <div className="mx-auto grid min-h-0 w-full max-w-6xl flex-1 grid-rows-[minmax(0,1fr)] gap-6 px-5 pb-5 sm:px-6 lg:grid-cols-[minmax(0,20rem)_minmax(0,1fr)]">
+        <div
+          className={cn("min-h-0 min-w-0 flex-col gap-2", detailOpen ? "hidden lg:flex" : "flex")}
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <div className="min-w-0 flex-1">
+              <SkillsFilterBar
+                scope={snapshot.scope}
+                query={query}
+                onQueryChange={setQuery}
+                filter={filter}
+                onFilterChange={setFilter}
+              />
+            </div>
+            {addButton}
+          </div>
+          {syncNames.length > 0 ? (
+            <Alert variant="info">
+              <AlertDescription>
+                {syncNames.length === 1
+                  ? "1 skill is missing from an agent you've turned on."
+                  : `${syncNames.length} skills are missing from an agent you've turned on.`}
+              </AlertDescription>
+              <AlertAction>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={syncing}
+                  onClick={() => void syncProviders(syncNames)}
+                >
+                  Add to all agents
+                </Button>
+              </AlertAction>
+            </Alert>
+          ) : null}
+          <div className="min-h-0 flex-1 overflow-hidden rounded-lg border">
+            {total > 0 ? (
+              <ScrollArea>
+                <SkillsList sections={sections} snapshot={snapshot} actions={listActions} />
+              </ScrollArea>
+            ) : (
+              <div className="flex flex-col items-start gap-2 p-3 text-sm text-muted-foreground">
+                <p>
+                  {isGlobal
+                    ? "Nothing in My skills yet. Bring in skills your agents already have, or create one."
+                    : "This project has no skills of its own yet."}
+                </p>
+                {isGlobal && discoverable.length > 0 ? (
+                  <Button size="xs" variant="outline" onClick={() => setDiscoverOpen(true)}>
+                    Manage existing skills ({discoverable.length})
+                  </Button>
+                ) : null}
+              </div>
+            )}
+          </div>
+          <div className="flex min-w-0 items-center justify-between gap-2">
+            <span className="text-xs text-muted-foreground tabular-nums">
+              {listed === total
+                ? `${total} ${total === 1 ? "skill" : "skills"}`
+                : `${listed} of ${total}`}
+            </span>
+            <Button size="xs" variant="ghost" onClick={() => setProvidersOpen(true)}>
+              How agents find skills
+            </Button>
+          </div>
+        </div>
+
+        <div className={cn("min-h-0 min-w-0 flex-col", detailOpen ? "flex" : "hidden lg:flex")}>
+          {selectedEntry !== null ? (
+            <>
+              <div className="pb-2 lg:hidden">
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => void guarded(() => setSelectedEntryId(null))()}
+                >
+                  <ChevronLeftIcon />
+                  {isGlobal ? "My skills" : "All skills"}
                 </Button>
               </div>
-              {visibleEntries.length > 0 ? (
-                <SkillsList
-                  entries={visibleEntries}
-                  selectedId={selectedEntry?.id ?? null}
-                  onSelect={selectEntry}
-                />
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  {snapshot.entries.length === 0
-                    ? "No skills yet. Create one, or add skills to a provider folder and refresh."
-                    : "No skills match."}
-                </p>
-              )}
-              <SkillsProviders snapshot={snapshot} />
+              {/* Keyed per skill so picking another one starts at the top. */}
+              <ScrollArea key={`${scopeKey}:${selectedEntry.id}`} className="min-h-0 flex-1">
+                <div className="flex flex-col gap-4 pr-4 pb-6">
+                  {entryGone ? (
+                    <Alert variant="warning">
+                      <AlertTitle>This skill is no longer listed</AlertTitle>
+                      <AlertDescription>
+                        It was moved or removed outside this page. Your unsaved edits are still
+                        here. Copy anything you want to keep.
+                      </AlertDescription>
+                    </Alert>
+                  ) : null}
+                  <SkillDetail
+                    key={`${scopeKey}:${selectedEntry.id}:${editorEpoch}`}
+                    environmentId={environmentId}
+                    scope={scope}
+                    snapshot={snapshot}
+                    entry={selectedEntry}
+                    pendingEnabled={pendingHere.get(selectedEntry.id)}
+                    onToggle={toggleEntry}
+                    onDirtyChange={onDirtyChange}
+                    confirmDiscard={confirmDiscard}
+                    onSelectEntry={selectEntry}
+                    canSelectEntry={canSelectEntry}
+                    onImport={setImportEntry}
+                    onRelease={openRelease}
+                    onEditInMySkills={editInMySkills}
+                    onSync={(names) => void syncProviders(names)}
+                    syncing={syncing}
+                  />
+                </div>
+              </ScrollArea>
+            </>
+          ) : (
+            <div className="flex min-h-0 flex-1 rounded-lg border border-dashed">
+              <Empty>
+                <EmptyHeader>
+                  <EmptyTitle>Select a skill</EmptyTitle>
+                  <EmptyDescription>
+                    {isGlobal
+                      ? "Turn it on or off, see which agents have it, and edit its files."
+                      : "Turn it on or off for this project and read its files."}
+                  </EmptyDescription>
+                </EmptyHeader>
+              </Empty>
             </div>
-            <div className="flex min-w-0 flex-col gap-4">
-              {entryGone ? (
-                <Alert variant="warning">
-                  <AlertTitle>This skill is no longer listed</AlertTitle>
-                  <AlertDescription>
-                    It was moved or removed outside this page. Your unsaved edits are still here.
-                    Copy anything you want to keep.
-                  </AlertDescription>
-                </Alert>
-              ) : null}
-              {selectedEntry !== null ? (
-                <SkillDetail
-                  key={`${scopeKey}:${selectedEntry.id}:${editorEpoch}`}
+          )}
+        </div>
+      </div>
+    );
+
+    return (
+      <div className="flex min-h-0 flex-1 flex-col">
+        {toolbar}
+        {tab === "skills" ? (
+          skillsPane
+        ) : (
+          <ScrollArea className="min-h-0 flex-1">
+            <WorkspacePageContainer width="expanded" className="pt-0">
+              {tab === "instructions" ? (
+                <SkillsInstructions
+                  key={`${scopeKey}:${editorEpoch}`}
                   environmentId={environmentId}
                   scope={scope}
                   snapshot={snapshot}
-                  entry={selectedEntry}
                   onDirtyChange={onDirtyChange}
                   confirmDiscard={confirmDiscard}
-                  onSelectEntry={selectEntry}
-                  onImport={setImportEntry}
                 />
               ) : (
-                <p className="text-sm text-muted-foreground">
-                  Select a skill to see where providers find it and edit its files.
-                </p>
+                <SkillsRecovery environmentId={environmentId} scope={scope} snapshot={snapshot} />
               )}
-            </div>
-          </section>
-        ) : tab === "instructions" ? (
-          <SkillsInstructions
-            key={`${scopeKey}:${editorEpoch}`}
-            environmentId={environmentId}
-            scope={scope}
-            snapshot={snapshot}
-            onDirtyChange={onDirtyChange}
-            confirmDiscard={confirmDiscard}
-          />
-        ) : (
-          <SkillsRecovery environmentId={environmentId} scope={scope} snapshot={snapshot} />
+            </WorkspacePageContainer>
+          </ScrollArea>
         )}
 
         <NewSkillDialog
@@ -578,7 +890,42 @@ export function SkillsPage() {
             onImported={openWrittenSkill(scopeKey)}
           />
         ) : null}
-      </>
+        {snapshot.scope.kind === "global" ? (
+          <DiscoverSkillsDialog
+            open={discoverOpen}
+            onOpenChange={setDiscoverOpen}
+            snapshot={snapshot}
+            onManage={(entry) => {
+              setDiscoverOpen(false);
+              setImportEntry(entry);
+            }}
+          />
+        ) : null}
+        {releaseEntry !== null ? (
+          <ReleaseSkillDialog
+            key={releaseEntry.id}
+            entry={releaseEntry}
+            environmentId={environmentId}
+            onOpenChange={(open) => {
+              if (!open) setReleaseEntry(null);
+            }}
+            onReleased={() => setSelectedEntryId(null)}
+          />
+        ) : null}
+        <Dialog open={providersOpen} onOpenChange={setProvidersOpen}>
+          <DialogPopup className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>How agents find skills</DialogTitle>
+              <DialogDescription>
+                The folders each agent reads on {environment.label}, and what T3 can't see.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogPanel>
+              <SkillsProviders snapshot={snapshot} />
+            </DialogPanel>
+          </DialogPopup>
+        </Dialog>
+      </div>
     );
   })();
 
@@ -588,9 +935,7 @@ export function SkillsPage() {
         <WorkspacePageHeader electron={isElectron} className="h-auto">
           {topbar}
         </WorkspacePageHeader>
-        <ScrollArea className="min-h-0 flex-1">
-          <WorkspacePageContainer width="expanded">{body}</WorkspacePageContainer>
-        </ScrollArea>
+        {content}
       </div>
     </SidebarInset>
   );

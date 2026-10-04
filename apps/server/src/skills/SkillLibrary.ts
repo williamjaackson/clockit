@@ -15,7 +15,14 @@
  *   of its own edits the one its agents inherit.
  * - `skill-recovery/<id>/`: archived skills and originals moved aside to
  *   make room for a link, each restorable.
- * - `skill-library.json`: links to restore when a disabled skill comes back.
+ * - `skill-library.json`: links to restore when a disabled skill comes back,
+ *   and the targets the user unlinked each skill from.
+ *
+ * New global skills link into the default targets, which together reach
+ * every provider enabled in T3's settings. Syncing providers adds missing
+ * default links later, and nothing propagates on its own. Private project
+ * profiles inherit the global library and can switch its skills off for T3
+ * agents in that project only.
  *
  * Provider folders get one symlink per skill. A link counts as T3's own only
  * when it points straight at the canonical copy, and nothing else is ever
@@ -36,6 +43,7 @@
 import * as NodeCrypto from "node:crypto";
 
 import {
+  type ProviderDriverKind,
   type ResolvedSkillScope,
   type SkillConflict,
   type SkillEntry,
@@ -43,6 +51,7 @@ import {
   type SkillInstructionsDocument,
   type SkillInstructionsSummary,
   type SkillLinkStatus,
+  type SkillLinkTarget,
   type SkillOrigin,
   type SkillOwnership,
   type SkillProjectInstructionMode as SkillProjectInstructionModeType,
@@ -62,13 +71,20 @@ import {
   type SkillsReadInstructionsInput,
   type SkillsReadResult,
   type SkillsRecoveryInput,
+  type SkillsReleaseInput,
+  type SkillsReleaseResult,
+  type SkillsResetProjectInput,
+  type SkillsResetProjectResult,
   type SkillsRestoreResult,
   type SkillsSaveInput,
   type SkillsSaveInstructionsInput,
   type SkillsSaveResult,
   type SkillsSetEnabledInput,
+  type SkillsSetEnabledManyInput,
   type SkillsSetEnabledResult,
   type SkillsSnapshot,
+  type SkillsSyncProvidersInput,
+  type SkillsSyncProvidersResult,
   type SkillsUnlinkInput,
   type SkillsUnlinkResult,
   type SkillsUpdateProjectSettingsInput,
@@ -98,6 +114,8 @@ import * as ServerSettings from "../serverSettings.ts";
 import {
   globalSkillRoots,
   instructionLinkTargets,
+  isProjectSkillFolder,
+  planDefaultLinks,
   projectInstructionFiles,
   projectInstructionLinkTargets,
   projectSkillLinkTargets,
@@ -115,6 +133,7 @@ import {
   listSkillDirectory,
   listSkillFiles,
   makeScanBudget,
+  type ScanBudget,
   type ScannedSkill,
   scanSkillRoots,
 } from "./skillScan.ts";
@@ -129,6 +148,13 @@ const LibraryState = Schema.Struct({
   version: Schema.Literal(1),
   /** Link paths a disabled global skill had, keyed by skill name. */
   disabledLinks: Schema.Record(Schema.String, Schema.Array(Schema.String)),
+  /**
+   * Link paths the user unlinked a global skill from, keyed by skill name.
+   * Default links and syncing skip them until the user links them again.
+   */
+  linkExclusions: Schema.Record(Schema.String, Schema.Array(Schema.String)).pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
+  ),
 });
 type LibraryState = typeof LibraryState.Type;
 const LibraryStateJson = Schema.fromJsonString(LibraryState);
@@ -138,6 +164,13 @@ const ProjectManifest = Schema.Struct({
   projectRoot: Schema.String,
   /** Repository skill entry paths, relative to the root and `/`-separated. */
   disabledRepoSkills: Schema.Array(Schema.String),
+  /**
+   * Global library skill names switched off in this project. Kept for names
+   * no longer in the library, so a skill that comes back stays off here.
+   */
+  disabledGlobalSkills: Schema.Array(Schema.String).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   instructionMode: SkillProjectInstructionMode,
   /** Kept for files written before it was locked to `true`. Never applied as `false`. */
   globalInstructionsEnabled: Schema.Boolean,
@@ -180,18 +213,22 @@ export interface ProjectSkillOverlay {
     readonly invocationName?: string;
   }>;
   /**
-   * Repository skills to hide from T3 agents. `name` is the invocation name,
-   * which Codex and the catalog match on; `folderName` is the repository
-   * folder, which Claude Code names a skill by. `disabled` entries are folders
-   * the user switched off. `replaced` entries are shadowed by a private skill
-   * with the same invocation name: one entry with `path: null` covers the
-   * name wherever the repository keeps it, and one entry per repository
-   * folder found carries its path and `folderName`.
+   * Native skills to hide from T3 agents: repository skills, and global
+   * library skills the project switched off. `name` is the invocation name,
+   * which Codex and the catalog match on; `folderName` is the skill folder,
+   * which Claude Code names a skill by. `disabled` entries are skills the
+   * user switched off. A global one has the library copy as `path` and every
+   * provider path that reaches it as `aliases`, since a provider may report
+   * either. `replaced` entries are shadowed by a private skill with the same
+   * invocation name: one entry with `path: null` covers the name wherever it
+   * is kept, and one entry per repository folder found carries its path and
+   * `folderName`.
    */
   readonly suppressedRepoSkills: ReadonlyArray<{
     readonly name: string;
     readonly folderName?: string;
     readonly path: string | null;
+    readonly aliases?: ReadonlyArray<string>;
     readonly reason: "disabled" | "replaced";
   }>;
   readonly instructions: {
@@ -236,6 +273,22 @@ export class SkillLibrary extends Context.Service<
     readonly setEnabled: (
       input: SkillsSetEnabledInput,
     ) => Effect.Effect<SkillsSetEnabledResult, SkillsError>;
+    /** Switch several skills of one scope together: all of them, or none on failure. */
+    readonly setEnabledMany: (
+      input: SkillsSetEnabledManyInput,
+    ) => Effect.Effect<SkillsSetEnabledResult, SkillsError>;
+    /** Clear a private profile's switches for inherited or repository skills. */
+    readonly resetProject: (
+      input: SkillsResetProjectInput,
+    ) => Effect.Effect<SkillsResetProjectResult, SkillsError>;
+    /** Add missing default links for enabled global skills. Never removes anything. */
+    readonly syncProviders: (
+      input: SkillsSyncProvidersInput,
+    ) => Effect.Effect<SkillsSyncProvidersResult, SkillsError>;
+    /** Move a global skill out of the library, keeping the providers that reach it. */
+    readonly release: (
+      input: SkillsReleaseInput,
+    ) => Effect.Effect<SkillsReleaseResult, SkillsError>;
     /** Move a library skill to recovery, removing only T3's links. */
     readonly archive: (
       input: SkillsArchiveInput,
@@ -326,6 +379,19 @@ type LinkState =
 
 type Journal = Array<Effect.Effect<void, PlatformError.PlatformError | SkillsError>>;
 
+type TargetInfo = SkillLinkTargetSpec & {
+  /** Every target folder merged into this one because they are physically one. */
+  readonly memberPaths: ReadonlyArray<string>;
+  readonly isDefault: boolean;
+};
+
+const toLinkTarget = ({ id, path, providers, isDefault }: TargetInfo): SkillLinkTarget => ({
+  id,
+  path,
+  providers,
+  ...(isDefault ? { default: true } : {}),
+});
+
 const sha256 = (value: string) => NodeCrypto.createHash("sha256").update(value).digest("hex");
 const revisionOf = (content: string) => sha256(content).slice(0, 16);
 
@@ -359,6 +425,7 @@ const defaultManifest = (projectRoot: string): ProjectManifest => ({
   version: 1,
   projectRoot,
   disabledRepoSkills: [],
+  disabledGlobalSkills: [],
   instructionMode: "inherit",
   globalInstructionsEnabled: true,
 });
@@ -572,22 +639,28 @@ const make = Effect.gen(function* () {
       Effect.mapError(fsError("Could not write a file.", filePath)),
     );
 
+  /** Create a folder inside a transaction; the journal removes the topmost folder it created. */
+  const ensureDirJournaled = (directory: string, journal: Journal) =>
+    Effect.gen(function* () {
+      let createdDir: string | undefined;
+      for (let current = directory; ; current = path.dirname(current)) {
+        if ((yield* pathState(current)).kind !== "missing") break;
+        createdDir = current;
+        if (path.dirname(current) === current) break;
+      }
+      if (createdDir !== undefined) {
+        yield* ensureDir(directory);
+        journal.push(fileSystem.remove(createdDir, { recursive: true }));
+      }
+    });
+
   /**
    * Write a file inside a transaction. The journal puts back its previous
    * bytes, or removes it and the topmost folder this write had to create.
    */
   const writeTextJournaled = (filePath: string, contents: string, journal: Journal) =>
     Effect.gen(function* () {
-      let createdDir: string | undefined;
-      for (let directory = path.dirname(filePath); ; directory = path.dirname(directory)) {
-        if ((yield* pathState(directory)).kind !== "missing") break;
-        createdDir = directory;
-        if (path.dirname(directory) === directory) break;
-      }
-      if (createdDir !== undefined) {
-        yield* ensureDir(path.dirname(filePath));
-        journal.push(fileSystem.remove(createdDir, { recursive: true }));
-      }
+      yield* ensureDirJournaled(path.dirname(filePath), journal);
       const previous = yield* fileSystem.readFile(filePath).pipe(
         Effect.asSome,
         Effect.catchIf(
@@ -758,7 +831,9 @@ const make = Effect.gen(function* () {
   const encodeRecovery = Schema.encodeEffect(RecoveryRecordJson);
 
   const readLibraryState = readJsonFile(libraryStatePath, decodeLibraryState).pipe(
-    Effect.map(Option.getOrElse((): LibraryState => ({ version: 1, disabledLinks: {} }))),
+    Effect.map(
+      Option.getOrElse((): LibraryState => ({ version: 1, disabledLinks: {}, linkExclusions: {} })),
+    ),
   );
   const writeLibraryState = (state: LibraryState, journal: Journal) =>
     writeJsonFile(libraryStatePath, encodeLibraryState, state, journal);
@@ -896,15 +971,19 @@ const make = Effect.gen(function* () {
 
   // ── scopes ───────────────────────────────────────────────────────────
 
+  /** `~` and `~/...` against the host user's home, as a shell would. */
+  const expandHome = (target: string) => {
+    const home = (
+      hostPlatform === "win32" ? hostEnvironment.USERPROFILE : hostEnvironment.HOME
+    )?.trim();
+    return home && (target === "~" || target.startsWith("~/"))
+      ? path.join(home, target.slice(1))
+      : target;
+  };
+
   const resolveProjectRoot = (projectPath: string) =>
     Effect.gen(function* () {
-      const home = (
-        hostPlatform === "win32" ? hostEnvironment.USERPROFILE : hostEnvironment.HOME
-      )?.trim();
-      const expanded =
-        home && (projectPath === "~" || projectPath.startsWith("~/"))
-          ? path.join(home, projectPath.slice(1))
-          : projectPath;
+      const expanded = expandHome(projectPath);
       if (!path.isAbsolute(expanded)) {
         return yield* skillsError("invalidPath", "Project paths must be absolute.", {
           path: projectPath,
@@ -1054,21 +1133,110 @@ const make = Effect.gen(function* () {
 
   // ── snapshot ─────────────────────────────────────────────────────────
 
-  /** Link targets with folders that are physically one merged into the first. */
-  const distinctTargets = (specs: ReadonlyArray<SkillLinkTargetSpec>) =>
+  /**
+   * Link targets with folders that are physically one merged into the first.
+   * `memberPaths` keeps every folder merged in, and a merged target is a
+   * default when any of them is.
+   */
+  const distinctTargets = (
+    specs: ReadonlyArray<SkillLinkTargetSpec>,
+    defaults: ReadonlySet<string> = new Set(),
+  ) =>
     Effect.gen(function* () {
-      const byPhysical = new Map<string, SkillLinkTargetSpec>();
+      const byPhysical = new Map<string, TargetInfo>();
       for (const spec of specs) {
         const physical = (yield* physicalLocation(spec.path)) ?? path.resolve(spec.path);
         const existing = byPhysical.get(physical);
         byPhysical.set(
           physical,
           existing
-            ? { ...existing, providers: [...new Set([...existing.providers, ...spec.providers])] }
-            : spec,
+            ? {
+                ...existing,
+                providers: [...new Set([...existing.providers, ...spec.providers])],
+                memberPaths: [...existing.memberPaths, spec.path],
+                isDefault: existing.isDefault || defaults.has(spec.path),
+              }
+            : { ...spec, memberPaths: [spec.path], isDefault: defaults.has(spec.path) },
         );
       }
       return [...byPhysical.values()];
+    });
+
+  /** Global link targets, with the ones a new skill links into marked. */
+  const globalLinkTargets = (homes: SkillHomes) =>
+    distinctTargets(
+      skillLinkTargets(path, homes),
+      new Set(planDefaultLinks(path, homes, { reached: new Set(), excluded: new Set() })),
+    );
+
+  /**
+   * Every provider skill folder entry named `name` that reaches `canonical`,
+   * link targets first, in target order. `owned` entries are T3's own links.
+   * Folders that are physically one each appear, with the same `physical`.
+   */
+  const libraryReaders = (homes: SkillHomes, name: string, canonical: string) =>
+    Effect.gen(function* () {
+      const targetOrder = skillLinkTargets(path, homes).map((target) => target.path);
+      const rank = (folder: string) => {
+        const index = targetOrder.indexOf(folder);
+        return index === -1 ? targetOrder.length : index;
+      };
+      const roots = globalSkillRoots(path, homes)
+        .filter((root) => root.kind === "skills")
+        .toSorted((left, right) => rank(left.path) - rank(right.path));
+      const readers: Array<{
+        readonly rootPath: string;
+        readonly entryPath: string;
+        readonly providers: ReadonlyArray<ProviderDriverKind>;
+        readonly owned: boolean;
+        readonly physical: string;
+      }> = [];
+      for (const root of roots) {
+        const entryPath = path.join(root.path, name);
+        const state = yield* classifyLink(entryPath, canonical);
+        if (state.kind !== "owned" && state.kind !== "inherited") continue;
+        readers.push({
+          rootPath: root.path,
+          entryPath,
+          providers: root.providers,
+          owned: state.kind === "owned",
+          physical: yield* canonicalForm(entryPath),
+        });
+      }
+      return readers;
+    });
+
+  /**
+   * Link a global library skill into the default targets it does not reach
+   * yet. Targets the user unlinked it from are skipped, and so is any path
+   * something else holds: nothing is replaced.
+   */
+  const applyDefaultLinks = (
+    homes: SkillHomes,
+    name: string,
+    exclusions: ReadonlyArray<string>,
+    journal: Journal,
+  ) =>
+    Effect.gen(function* () {
+      const canonical = path.join(libraryDir, name);
+      const readers = yield* libraryReaders(homes, name, canonical);
+      const planned = planDefaultLinks(path, homes, {
+        reached: new Set(readers.map((reader) => reader.rootPath)),
+        excluded: new Set(exclusions.map((linkPath) => path.dirname(linkPath))),
+      });
+      const linked: Array<string> = [];
+      const skipped: Array<string> = [];
+      for (const folder of planned) {
+        const linkPath = path.join(folder, name);
+        const state = yield* classifyLink(linkPath, canonical);
+        if (state.kind === "missing") {
+          yield* createLink(canonical, linkPath, journal);
+          linked.push(linkPath);
+        } else if (state.kind === "occupied") {
+          skipped.push(linkPath);
+        }
+      }
+      return { linked, skipped };
     });
 
   const linkStatus = (
@@ -1088,6 +1256,62 @@ const make = Effect.gen(function* () {
         case "occupied":
           return { ...base, state: "occupied", occupant: state.occupant };
       }
+    });
+
+  /**
+   * The global library as a local project scope inherits it: read-only
+   * `inherited:<name>` entries. One is on in the project when it is on
+   * globally, the project has not switched it off, and no private skill
+   * takes its name.
+   */
+  const inheritedEntries = (
+    homes: SkillHomes,
+    budget: ScanBudget,
+    manifest: ProjectManifest | undefined,
+    privateEnabledNames: ReadonlySet<string>,
+  ) =>
+    Effect.gen(function* () {
+      const disabledHere = new Set(manifest?.disabledGlobalSkills ?? []);
+      const entries: Array<Omit<SkillEntry, "conflicts">> = [];
+      for (const library of [
+        { directory: libraryDir, enabled: true },
+        { directory: disabledDir, enabled: false },
+      ]) {
+        for (const name of yield* listSkillDirectory(library.directory, budget)) {
+          if (Option.isNone(decodeSkillName(name))) continue;
+          const canonical = path.join(library.directory, name);
+          if ((yield* pathState(canonical)).kind !== "directory") continue;
+          const inspected = yield* inspectSkillFolder(canonical, budget);
+          if (!inspected) continue;
+          const readers = library.enabled ? yield* libraryReaders(homes, name, canonical) : [];
+          const origins = readers.map((reader): SkillOrigin => ({
+            providers: reader.providers,
+            rootPath: reader.rootPath,
+            entryPath: reader.entryPath,
+            ownedLink: reader.owned,
+          }));
+          const invocationName = inspected.frontmatterName ?? name;
+          const projectDisabled = disabledHere.has(name);
+          entries.push({
+            id: `inherited:${name}`,
+            name,
+            invocationName,
+            ...(inspected.description === undefined ? {} : { description: inspected.description }),
+            scope: "global",
+            ownership: "managed",
+            enabled:
+              library.enabled && !projectDisabled && !privateEnabledNames.has(invocationName),
+            path: inspected.realPath,
+            providers: [...new Set(origins.flatMap((origin) => origin.providers))],
+            origins,
+            links: [],
+            editable: false,
+            globallyEnabled: library.enabled,
+            projectDisabled,
+          });
+        }
+      }
+      return entries;
     });
 
   const buildSnapshot = (scope: ResolvedScope): Effect.Effect<SkillsSnapshot, SkillsError> =>
@@ -1151,11 +1375,12 @@ const make = Effect.gen(function* () {
               .map((skill) => skill.invocationName)
           : [],
       );
-      const globalTargets = yield* distinctTargets(skillLinkTargets(path, homes));
+      const globalTargets = yield* globalLinkTargets(homes);
       const linkTargets =
         scope.mode === "shared"
           ? yield* distinctTargets(projectSkillLinkTargets(path, scope.projectRoot!))
           : globalTargets;
+      const libraryState = scope.kind === "global" ? yield* readLibraryState : undefined;
       const realProjectRoot = scope.projectRoot;
 
       const drafts: Array<Omit<SkillEntry, "conflicts">> = [];
@@ -1194,11 +1419,12 @@ const make = Effect.gen(function* () {
           });
         }
         const repoPaths = repositoryPaths(scope, skill.origins);
+        const projectDisabled =
+          manifest !== undefined && repoPaths.some((relative) => disabledRepo.has(relative));
         const enabled = managedInfo
           ? managedInfo.enabled
           : manifest === undefined ||
-            (!repoPaths.some((relative) => disabledRepo.has(relative)) &&
-              !privateEnabledNames.has(skill.invocationName));
+            (!projectDisabled && !privateEnabledNames.has(skill.invocationName));
         const editable =
           managedInfo !== undefined ||
           (scope.mode === "shared" &&
@@ -1208,11 +1434,33 @@ const make = Effect.gen(function* () {
         const linkable =
           canonical !== undefined &&
           ((managedInfo?.enabled && scope.kind === "global") || sharedCanonical !== undefined);
-        const links = linkable
-          ? yield* Effect.forEach(linkTargets, (target) =>
-              linkStatus(target, path.join(target.path, path.basename(canonical)), canonical),
-            )
-          : [];
+        let links: Array<SkillLinkStatus> = [];
+        if (linkable) {
+          const name = path.basename(canonical);
+          const excluded = new Set(libraryState?.linkExclusions[name] ?? []);
+          const wanted =
+            libraryState === undefined
+              ? new Set<string>()
+              : new Set(
+                  planDefaultLinks(path, homes, {
+                    reached: new Set(skill.origins.map((origin) => origin.rootPath)),
+                    excluded: new Set([...excluded].map((linkPath) => path.dirname(linkPath))),
+                  }),
+                );
+          links = yield* Effect.forEach(linkTargets, (target) =>
+            Effect.map(
+              linkStatus(target, path.join(target.path, name), canonical),
+              (status): SkillLinkStatus => ({
+                ...status,
+                ...(excluded.has(status.path) ? { excluded: true } : {}),
+                ...(status.state !== "linked" &&
+                target.memberPaths.some((folder) => wanted.has(folder))
+                  ? { syncPending: true }
+                  : {}),
+              }),
+            ),
+          );
+        }
         drafts.push({
           id: managedInfo ? `managed:${managedInfo.name}` : sha256(skill.realPath).slice(0, 16),
           name: skill.name,
@@ -1227,12 +1475,19 @@ const make = Effect.gen(function* () {
           links,
           editable,
           ...(skill.pluginId === undefined ? {} : { pluginId: skill.pluginId }),
+          ...(scope.mode === "local" && !managedInfo ? { projectDisabled } : {}),
         });
+      }
+      if (scope.mode === "local") {
+        drafts.push(...(yield* inheritedEntries(homes, budget, manifest, privateEnabledNames)));
       }
 
       // Providers collide on the name they load a skill under, not its folder.
+      // In a local project scope, an enabled private skill replaces the rest.
       const invocationNameOf = (draft: Omit<SkillEntry, "conflicts">) =>
         draft.invocationName ?? draft.name;
+      const isPrivate = (draft: Omit<SkillEntry, "conflicts">) =>
+        scope.mode === "local" && draft.id.startsWith("managed:");
       const byName = new Map<string, Array<Omit<SkillEntry, "conflicts">>>();
       for (const draft of drafts) {
         const key = invocationNameOf(draft);
@@ -1247,8 +1502,7 @@ const make = Effect.gen(function* () {
               entryId: other.id,
               path: other.path,
               reason:
-                scope.mode === "local" &&
-                (draft.ownership === "managed") !== (other.ownership === "managed") &&
+                isPrivate(draft) !== isPrivate(other) &&
                 privateEnabledNames.has(invocationNameOf(draft))
                   ? "replacedByLocal"
                   : "duplicateName",
@@ -1256,7 +1510,9 @@ const make = Effect.gen(function* () {
         }))
         .toSorted(
           (left, right) =>
-            left.name.localeCompare(right.name) || left.path.localeCompare(right.path),
+            left.name.localeCompare(right.name) ||
+            left.path.localeCompare(right.path) ||
+            left.id.localeCompare(right.id),
         );
 
       const instructionTargets = instructionLinkTargets(path, homes);
@@ -1273,8 +1529,9 @@ const make = Effect.gen(function* () {
       return {
         scope: resolvedScope,
         entries,
-        linkTargets,
+        linkTargets: linkTargets.map(toLinkTarget),
         providers: providerSupport({
+          enabledProviders: homes.enabledProviders,
           globalRoots,
           linkTargets: globalTargets,
           instructionTargets,
@@ -1356,9 +1613,7 @@ const make = Effect.gen(function* () {
                 (origin) => origin.entryPath === path.join(scope.libraryDir, ref.name),
               ),
             )
-          : snapshot.entries.find(
-              (candidate) => candidate.ownership === "managed" && candidate.name === ref.name,
-            );
+          : snapshot.entries.find((candidate) => candidate.id === `managed:${ref.name}`);
     return entry
       ? Effect.succeed(entry)
       : Effect.fail(skillsError("notFound", "The skill is not listed in this scope."));
@@ -1512,7 +1767,9 @@ const make = Effect.gen(function* () {
               "readOnly",
               entry.ownership === "plugin" || entry.ownership === "system"
                 ? "Skills installed by a provider are read-only."
-                : "Import this skill into the library to edit it.",
+                : entry.id.startsWith("inherited:")
+                  ? "This skill belongs to the global library. Edit it there for every project, or import it for a private copy in this one."
+                  : "Import this skill into the library to edit it.",
               { path: entry.path },
             );
           }
@@ -1522,11 +1779,18 @@ const make = Effect.gen(function* () {
         if (scope.mode === "shared") yield* requireInsideProject(scope.projectRoot!, target);
         const current = yield* readTextIfExists(target);
         yield* checkRevision(target, current, input.expectedRevision);
+        const created = (yield* pathState(skillDir)).kind === "missing";
         yield* writeTextJournaled(target, input.content, journal);
         yield* ensureProjectState(scope, journal);
+        // A new global skill is for every enabled provider from the start.
+        const defaults =
+          created && scope.kind === "global"
+            ? yield* applyDefaultLinks(yield* loadHomes, path.basename(skillDir), [], journal)
+            : undefined;
         return {
           path: target,
           revision: revisionOf(input.content),
+          ...(defaults === undefined ? {} : { skippedLinks: defaults.skipped }),
           snapshot: yield* buildSnapshot(scope),
         };
       }),
@@ -1623,10 +1887,15 @@ const make = Effect.gen(function* () {
           }
         }
         yield* ensureProjectState(scope, journal);
+        const defaults =
+          scope.kind === "global"
+            ? yield* applyDefaultLinks(yield* loadHomes, name, [], journal)
+            : undefined;
         return {
           name,
           path: destination,
           recovery: recovery.map(toRecoveryEntry),
+          ...(defaults === undefined ? {} : { skippedLinks: defaults.skipped }),
           snapshot: yield* buildSnapshot(scope),
         };
       }),
@@ -1664,90 +1933,124 @@ const make = Effect.gen(function* () {
       return skipped;
     });
 
-  const setEnabled: SkillLibrary["Service"]["setEnabled"] = (input) =>
+  const setEnabledMany: SkillLibrary["Service"]["setEnabledMany"] = (input) =>
     mutate(input.scope, (scope, journal) =>
       Effect.gen(function* () {
         yield* requireNotShared(
           scope,
           "Shared mode only edits repository files. Switch a repository skill off in local mode.",
         );
-        let name: string;
-        if ("name" in input.skill) {
-          name = input.skill.name;
-        } else {
-          const snapshot = yield* buildSnapshot(scope);
-          const entry = yield* findEntry(snapshot, scope, input.skill);
-          if (entry.ownership !== "managed") {
-            if (scope.mode !== "local" || entry.ownership !== "unmanaged") {
+        // Resolve and check every ref before changing anything.
+        const snapshot = input.skills.some((ref) => "entryId" in ref)
+          ? yield* buildSnapshot(scope)
+          : undefined;
+        const libraryNames = new Set<string>();
+        const inheritedNames = new Set<string>();
+        const repoPaths = new Set<string>();
+        for (const ref of input.skills) {
+          if ("name" in ref) {
+            libraryNames.add(ref.name);
+            continue;
+          }
+          const entry = yield* findEntry(snapshot!, scope, ref);
+          if (entry.id.startsWith("inherited:")) {
+            if (input.enabled && entry.globallyEnabled === false) {
               return yield* skillsError(
-                "readOnly",
-                "Import this skill into the library to switch it off here.",
+                "unsupported",
+                "This skill is off in the global library, so it is off in every project. Switch it on there first.",
                 { path: entry.path },
               );
             }
-            const manifest = (yield* readManifest(scope))!;
-            const disabled = new Set(manifest.disabledRepoSkills);
-            for (const relative of repositoryPaths(scope, entry.origins)) {
-              if (input.enabled) disabled.delete(relative);
-              else disabled.add(relative);
-            }
-            yield* writeManifest(
-              scope,
-              { ...manifest, disabledRepoSkills: [...disabled].toSorted() },
-              journal,
+            inheritedNames.add(entry.name);
+          } else if (entry.ownership === "managed") {
+            libraryNames.add(entry.name);
+          } else if (scope.mode === "local" && entry.ownership === "unmanaged") {
+            for (const relative of repositoryPaths(scope, entry.origins)) repoPaths.add(relative);
+          } else {
+            return yield* skillsError(
+              "readOnly",
+              entry.ownership === "plugin" || entry.ownership === "system"
+                ? "Skills installed by a provider are managed outside T3."
+                : "Import this skill into the library to switch it off here.",
+              { path: entry.path },
             );
-            return { skippedLinks: [], snapshot: yield* buildSnapshot(scope) };
           }
-          name = entry.name;
         }
 
-        const enabledPath = path.join(scope.libraryDir, name);
-        const disabledPath = path.join(scope.disabledDir!, name);
-        const [from, to] = input.enabled
-          ? [disabledPath, enabledPath]
-          : [enabledPath, disabledPath];
-        const fromState = yield* pathState(from);
-        const toState = yield* pathState(to);
-        if (fromState.kind === "missing") {
-          if (toState.kind === "directory") {
-            return { skippedLinks: [], snapshot: yield* buildSnapshot(scope) };
+        const moves: Array<{ readonly name: string; readonly from: string; readonly to: string }> =
+          [];
+        for (const name of libraryNames) {
+          const enabledPath = path.join(scope.libraryDir, name);
+          const disabledPath = path.join(scope.disabledDir!, name);
+          const [from, to] = input.enabled
+            ? [disabledPath, enabledPath]
+            : [enabledPath, disabledPath];
+          const fromState = yield* pathState(from);
+          const toState = yield* pathState(to);
+          if (fromState.kind === "missing") {
+            if (toState.kind === "directory") continue;
+            return yield* skillsError("notFound", "The library skill does not exist.", {
+              path: from,
+            });
           }
-          return yield* skillsError("notFound", "The library skill does not exist.", {
-            path: from,
-          });
-        }
-        if (toState.kind !== "missing") {
-          return yield* skillsError("conflict", "Both an enabled and a disabled copy exist.", {
-            conflictPaths: [to],
-          });
+          if (toState.kind !== "missing") {
+            return yield* skillsError("conflict", "Both an enabled and a disabled copy exist.", {
+              conflictPaths: [to],
+            });
+          }
+          moves.push({ name, from, to });
         }
 
-        let skippedLinks: Array<string> = [];
-        yield* ensureDir(path.dirname(to));
-        if (scope.kind === "global") {
-          const state = yield* readLibraryState;
-          if (input.enabled) {
+        const skippedLinks: Array<string> = [];
+        // Global moves add or drop remembered links; the state is written once.
+        const state =
+          scope.kind === "global" && moves.length > 0 ? yield* readLibraryState : undefined;
+        const disabledLinks = { ...state?.disabledLinks };
+        for (const { name, from, to } of moves) {
+          yield* ensureDir(path.dirname(to));
+          if (state === undefined) {
             yield* movePath(from, to);
             journal.push(movePath(to, from));
-            skippedLinks = yield* restoreLinks(name, state.disabledLinks[name] ?? [], journal);
-            const { [name]: _restored, ...remaining } = state.disabledLinks;
-            yield* writeLibraryState({ ...state, disabledLinks: remaining }, journal);
+          } else if (input.enabled) {
+            yield* movePath(from, to);
+            journal.push(movePath(to, from));
+            skippedLinks.push(...(yield* restoreLinks(name, disabledLinks[name] ?? [], journal)));
+            delete disabledLinks[name];
           } else {
             const removed = yield* removeOwnedLinks(name, journal);
             yield* movePath(from, to);
             journal.push(movePath(to, from));
-            yield* writeLibraryState(
-              { ...state, disabledLinks: { ...state.disabledLinks, [name]: removed } },
-              journal,
-            );
+            disabledLinks[name] = removed;
           }
-        } else {
-          yield* movePath(from, to);
-          journal.push(movePath(to, from));
+        }
+        if (state !== undefined) yield* writeLibraryState({ ...state, disabledLinks }, journal);
+
+        if (inheritedNames.size > 0 || repoPaths.size > 0) {
+          const manifest = (yield* readManifest(scope))!;
+          const toggle = (current: ReadonlyArray<string>, changed: ReadonlySet<string>) => {
+            const next = new Set(current);
+            for (const value of changed) {
+              if (input.enabled) next.delete(value);
+              else next.add(value);
+            }
+            return [...next].toSorted();
+          };
+          yield* writeManifest(
+            scope,
+            {
+              ...manifest,
+              disabledRepoSkills: toggle(manifest.disabledRepoSkills, repoPaths),
+              disabledGlobalSkills: toggle(manifest.disabledGlobalSkills, inheritedNames),
+            },
+            journal,
+          );
         }
         return { skippedLinks, snapshot: yield* buildSnapshot(scope) };
       }),
     );
+
+  const setEnabled: SkillLibrary["Service"]["setEnabled"] = (input) =>
+    setEnabledMany({ scope: input.scope, skills: [input.skill], enabled: input.enabled });
 
   const archive: SkillLibrary["Service"]["archive"] = (input) =>
     mutate(input.scope, (scope, journal) =>
@@ -2041,6 +2344,22 @@ const make = Effect.gen(function* () {
           }
           yield* createLink(yield* plan.linkText(linkPath), linkPath, journal);
         }
+        // Linking again undoes an earlier unlink, so syncing may use the target.
+        if (scope.kind === "global" && input.subject.type === "skill") {
+          const state = yield* readLibraryState;
+          const excluded = state.linkExclusions[name];
+          if (excluded !== undefined) {
+            const { [name]: _cleared, ...others } = state.linkExclusions;
+            const remaining = excluded.filter((entry) => !linkPaths.includes(entry));
+            yield* writeLibraryState(
+              {
+                ...state,
+                linkExclusions: remaining.length > 0 ? { ...others, [name]: remaining } : others,
+              },
+              journal,
+            );
+          }
+        }
         return {
           linked: linkPaths,
           recovery: recovery.map(toRecoveryEntry),
@@ -2062,25 +2381,278 @@ const make = Effect.gen(function* () {
           removed.push(linkPath);
         }
         // A disabled skill remembers links to restore; forget the unlinked ones.
+        // Remember the unlink itself so default links and syncing respect it.
         if (scope.kind === "global" && input.subject.type === "skill") {
+          const name = input.subject.name;
           const state = yield* readLibraryState;
-          const remembered = state.disabledLinks[input.subject.name];
-          if (remembered !== undefined) {
-            yield* writeLibraryState(
-              {
-                ...state,
-                disabledLinks: {
-                  ...state.disabledLinks,
-                  [input.subject.name]: remembered.filter((entry) => !linkPaths.includes(entry)),
-                },
+          const remembered = state.disabledLinks[name];
+          yield* writeLibraryState(
+            {
+              ...state,
+              disabledLinks:
+                remembered === undefined
+                  ? state.disabledLinks
+                  : {
+                      ...state.disabledLinks,
+                      [name]: remembered.filter((entry) => !linkPaths.includes(entry)),
+                    },
+              linkExclusions: {
+                ...state.linkExclusions,
+                [name]: [...new Set([...(state.linkExclusions[name] ?? []), ...linkPaths])],
               },
-              journal,
-            );
-          }
+            },
+            journal,
+          );
         }
         return { removed, snapshot: yield* buildSnapshot(scope) };
       }),
     );
+
+  const resetProject: SkillLibrary["Service"]["resetProject"] = (input) =>
+    mutate({ projectPath: input.projectPath, mode: "local" }, (scope, journal) =>
+      Effect.gen(function* () {
+        const sections = new Set(input.sections);
+        // A project without a profile has nothing to reset, and gets none.
+        const manifest = yield* exactManifest(scope.profileRoot!);
+        const inherited = sections.has("inherited") ? (manifest?.disabledGlobalSkills ?? []) : [];
+        const repository = sections.has("repository") ? (manifest?.disabledRepoSkills ?? []) : [];
+        if (manifest !== undefined && (inherited.length > 0 || repository.length > 0)) {
+          yield* writeManifest(
+            scope,
+            {
+              ...manifest,
+              disabledGlobalSkills: sections.has("inherited") ? [] : manifest.disabledGlobalSkills,
+              disabledRepoSkills: sections.has("repository") ? [] : manifest.disabledRepoSkills,
+            },
+            journal,
+          );
+        }
+        return {
+          inherited: [...inherited],
+          repository: [...repository],
+          snapshot: yield* buildSnapshot(scope),
+        };
+      }),
+    );
+
+  const syncProviders: SkillLibrary["Service"]["syncProviders"] = (input) =>
+    mutate({}, (scope, journal) =>
+      Effect.gen(function* () {
+        let names: ReadonlyArray<string>;
+        if (input.names !== undefined) {
+          for (const name of input.names) {
+            if ((yield* pathState(path.join(libraryDir, name))).kind === "directory") continue;
+            return (yield* pathState(path.join(disabledDir, name))).kind === "directory"
+              ? yield* skillsError("unsupported", "Switch the skill on before syncing it.")
+              : yield* skillsError("notFound", "The library skill does not exist.", {
+                  path: path.join(libraryDir, name),
+                });
+          }
+          names = input.names;
+        } else {
+          const listed = yield* listSkillDirectory(libraryDir, makeScanBudget()).pipe(
+            Effect.provideContext(services),
+          );
+          const found: Array<string> = [];
+          for (const name of listed) {
+            if (Option.isNone(decodeSkillName(name))) continue;
+            if ((yield* pathState(path.join(libraryDir, name))).kind === "directory") {
+              found.push(name);
+            }
+          }
+          names = found;
+        }
+        const homes = yield* loadHomes;
+        const state = yield* readLibraryState;
+        const linked: Array<string> = [];
+        const skippedLinks: Array<string> = [];
+        for (const name of names) {
+          const result = yield* applyDefaultLinks(
+            homes,
+            name,
+            state.linkExclusions[name] ?? [],
+            journal,
+          );
+          linked.push(...result.linked);
+          skippedLinks.push(...result.skipped);
+        }
+        return { linked, skippedLinks, snapshot: yield* buildSnapshot(scope) };
+      }),
+    );
+
+  /**
+   * What releasing a global skill would do, checked against the filesystem
+   * as it is now. Fails rather than cut off a provider that reaches the
+   * skill in a way T3 cannot carry over to the new location.
+   */
+  const releasePlan = (input: SkillsReleaseInput) =>
+    Effect.gen(function* () {
+      const enabledPath = path.join(libraryDir, input.name);
+      const wasEnabled = (yield* pathState(enabledPath)).kind === "directory";
+      const canonical = wasEnabled ? enabledPath : path.join(disabledDir, input.name);
+      if (!wasEnabled && (yield* pathState(canonical)).kind !== "directory") {
+        return yield* skillsError("notFound", "The library skill does not exist.", {
+          path: enabledPath,
+        });
+      }
+      const homes = yield* loadHomes;
+      const canonicalPhysical = yield* canonicalForm(canonical);
+      const readers = wasEnabled ? yield* libraryReaders(homes, input.name, canonical) : [];
+      const physicals = new Set(readers.map((reader) => reader.physical));
+      // A provider folder that is itself a link into the library, or someone
+      // else's link T3 cannot follow to one of its own, would lose the skill.
+      const stranded: Array<string> = [];
+      for (const reader of readers) {
+        if (reader.owned) continue;
+        if (reader.physical === canonicalPhysical) {
+          stranded.push(reader.entryPath);
+          continue;
+        }
+        const state = yield* pathState(reader.entryPath);
+        const next =
+          state.kind === "symlink"
+            ? yield* oneHopTarget(reader.entryPath, state.linkText)
+            : undefined;
+        if (next === undefined || !physicals.has(next)) stranded.push(reader.entryPath);
+      }
+      if (stranded.length > 0) {
+        return yield* skillsError(
+          "conflict",
+          "Some provider folders reach this skill through links T3 cannot move, and would lose it. Remove those links, or switch the skill off and release it to a folder of your choice.",
+          { conflictPaths: stranded },
+        );
+      }
+      const owned: Array<(typeof readers)[number]> = [];
+      for (const reader of readers) {
+        if (reader.owned && !owned.some((other) => other.physical === reader.physical)) {
+          owned.push(reader);
+        }
+      }
+
+      let destination: string;
+      if (input.destination !== undefined) {
+        const expanded = expandHome(input.destination);
+        if (!path.isAbsolute(expanded)) {
+          return yield* skillsError("invalidPath", "The destination must be an absolute path.", {
+            path: input.destination,
+          });
+        }
+        destination = path.resolve(expanded);
+      } else if (!wasEnabled) {
+        return yield* skillsError(
+          "unsupported",
+          "No agent can use a skill that is off, so it has no provider folder to go back to. Choose a folder outside every provider skill folder, or switch it on first.",
+        );
+      } else if (owned[0] !== undefined) {
+        destination = owned[0].entryPath;
+      } else {
+        destination = path.join(homes.home, ".agents", "skills", input.name);
+      }
+
+      const destinationState = yield* classifyLink(destination, canonical);
+      if (destinationState.kind !== "missing" && destinationState.kind !== "owned") {
+        return yield* skillsError(
+          "conflict",
+          "Something already exists at the destination. Choose another folder.",
+          { conflictPaths: [destination] },
+        );
+      }
+      const parent = yield* physicalLocation(path.dirname(destination));
+      if (parent === undefined) {
+        return yield* skillsError("invalidPath", "The destination's folder cannot be resolved.", {
+          path: destination,
+        });
+      }
+      for (const directory of storageDirs) {
+        if (isWithinOrEqual(yield* canonicalForm(directory), parent)) {
+          return yield* skillsError(
+            "invalidPath",
+            "The destination is inside T3's own skill storage.",
+            { path: destination },
+          );
+        }
+      }
+      if (!wasEnabled) {
+        const providerFolders = yield* Effect.forEach(
+          globalSkillRoots(path, homes).filter((root) => root.kind === "skills"),
+          (root) => Effect.map(physicalLocation(root.path), (physical) => physical ?? root.path),
+        );
+        if (
+          providerFolders.includes(parent) ||
+          isProjectSkillFolder(parent) ||
+          isProjectSkillFolder(path.dirname(destination))
+        ) {
+          return yield* skillsError(
+            "unsupported",
+            "A provider reads this folder, so releasing a skill that is off here would switch it on. Choose a folder outside every provider skill folder.",
+            { path: destination },
+          );
+        }
+      }
+      const destinationPhysical = path.join(parent, path.basename(destination));
+      return {
+        wasEnabled,
+        canonical,
+        destination,
+        replacesLink: destinationState.kind === "owned",
+        relinked: owned
+          .filter((reader) => reader.physical !== destinationPhysical)
+          .map((reader) => reader.entryPath),
+      };
+    });
+
+  const release: SkillLibrary["Service"]["release"] = (input) =>
+    input.dryRun
+      ? locked(
+          Effect.gen(function* () {
+            const plan = yield* releasePlan(input);
+            return {
+              name: input.name,
+              destination: plan.destination,
+              wasEnabled: plan.wasEnabled,
+              relinked: plan.relinked,
+              released: false,
+              snapshot: yield* buildSnapshot(globalScope),
+            };
+          }),
+        )
+      : mutate({}, (scope, journal) =>
+          Effect.gen(function* () {
+            const plan = yield* releasePlan(input);
+            if (plan.replacesLink) {
+              const state = yield* pathState(plan.destination);
+              if (state.kind === "symlink") {
+                yield* removePath(plan.destination);
+                journal.push(fileSystem.symlink(state.linkText, plan.destination));
+              }
+            }
+            yield* ensureDirJournaled(path.dirname(plan.destination), journal);
+            yield* movePath(plan.canonical, plan.destination);
+            journal.push(movePath(plan.destination, plan.canonical));
+            for (const linkPath of plan.relinked) {
+              const state = yield* pathState(linkPath);
+              if (state.kind !== "symlink") continue;
+              yield* removePath(linkPath);
+              journal.push(fileSystem.symlink(state.linkText, linkPath));
+              yield* createLink(plan.destination, linkPath, journal);
+            }
+            // The name is free in the library again, so it can be adopted back.
+            const state = yield* readLibraryState;
+            const { [input.name]: _links, ...disabledLinks } = state.disabledLinks;
+            const { [input.name]: _excluded, ...linkExclusions } = state.linkExclusions;
+            if (_links !== undefined || _excluded !== undefined) {
+              yield* writeLibraryState({ ...state, disabledLinks, linkExclusions }, journal);
+            }
+            return {
+              name: input.name,
+              destination: plan.destination,
+              wasEnabled: plan.wasEnabled,
+              relinked: plan.relinked,
+              released: true,
+              snapshot: yield* buildSnapshot(scope),
+            };
+          }),
+        );
 
   /** The canonical instruction file for a scope, checked for shared-mode escapes. */
   const instructionsPath = (scope: ResolvedScope, file: string | undefined) =>
@@ -2260,6 +2832,27 @@ const make = Effect.gen(function* () {
           reason: "disabled",
         });
       }
+      // Global library skills switched off here, at the library copy and at
+      // every provider path that reaches it. One off globally, or gone, has
+      // nothing to hide; its name stays in the manifest for when it returns.
+      const homes = manifest.disabledGlobalSkills.length > 0 ? yield* loadHomes : undefined;
+      for (const name of manifest.disabledGlobalSkills.slice(0, MAX_SUPPRESSED_REPO_SKILLS)) {
+        if (homes === undefined || Option.isNone(decodeSkillName(name))) continue;
+        const canonical = path.join(libraryDir, name);
+        if ((yield* pathState(canonical)).kind !== "directory") continue;
+        const inspected = yield* inspectSkillFolder(canonical, budget);
+        if (!inspected) continue;
+        const readers = yield* libraryReaders(homes, name, canonical);
+        disabled.push({
+          name: inspected.frontmatterName ?? name,
+          folderName: name,
+          path: inspected.realPath,
+          aliases: [
+            ...new Set(readers.flatMap((reader) => [reader.entryPath, reader.physical])),
+          ].filter((alias) => alias !== inspected.realPath),
+          reason: "disabled",
+        });
+      }
       // Repository folders a private skill shadows, so providers that name
       // skills by folder can switch off the right one. A profile inherited
       // from an enclosing folder covers the working folder's skills too, as
@@ -2342,6 +2935,10 @@ const make = Effect.gen(function* () {
     saveInstructions,
     importInstructions,
     updateProjectSettings,
+    setEnabledMany,
+    resetProject,
+    syncProviders,
+    release,
     resolveProjectOverlay,
     streamChanges: Stream.fromPubSub(changes),
   });

@@ -14,8 +14,10 @@ import * as NodeOS from "node:os";
 import {
   ClaudeSettings,
   CodexSettings,
+  DEFAULT_SERVER_SETTINGS,
   ProviderDriverKind,
   type ProviderInstanceConfig,
+  resolveProviderInstanceEnabled,
   type ServerSettings,
   type SkillProviderSupport,
 } from "@t3tools/contracts";
@@ -45,6 +47,12 @@ export interface SkillHomes {
   readonly claudeConfigDirs: ReadonlyArray<string>;
   readonly opencodeConfigDir: string;
   readonly geminiHome: string;
+  /** The Codex homes of instances enabled in T3's settings. */
+  readonly enabledCodexHomes: ReadonlyArray<string>;
+  /** The Claude config dirs of instances enabled in T3's settings. */
+  readonly enabledClaudeConfigDirs: ReadonlyArray<string>;
+  /** Providers with at least one instance enabled in T3's settings. */
+  readonly enabledProviders: ReadonlyArray<ProviderDriverKind>;
 }
 
 export interface SkillRootSpec {
@@ -65,17 +73,32 @@ export interface SkillLinkTargetSpec {
 const shortHash = (value: string) =>
   NodeCrypto.createHash("sha256").update(value).digest("hex").slice(0, 8);
 
+/**
+ * A driver's configured instances with whether each is enabled, by the same
+ * rule as the provider registry. Explicit default slots replace the legacy
+ * settings, as in the registry; T3's defaults enable Codex and Claude only.
+ */
 function instancesOf(
   settings: ServerSettings,
-  driver: "codex" | "claudeAgent",
-): ReadonlyArray<Pick<ProviderInstanceConfig, "config" | "environment">> {
-  // Explicit default slots replace the legacy settings, as in the provider registry.
-  const explicit = Object.values(settings.providerInstances).filter(
-    (instance) => instance.driver === driver,
-  );
-  return Object.hasOwn(settings.providerInstances, driver)
-    ? explicit
-    : [{ config: settings.providers[driver] }, ...explicit];
+  driver: ProviderDriverKind,
+): ReadonlyArray<{
+  readonly config: unknown;
+  readonly environment: ProviderInstanceConfig["environment"];
+  readonly enabled: boolean;
+}> {
+  const explicit: Array<
+    Pick<ProviderInstanceConfig, "driver" | "enabled" | "config" | "environment">
+  > = Object.values(settings.providerInstances).filter((instance) => instance.driver === driver);
+  const legacy = (settings.providers as Partial<Record<string, unknown>>)[driver];
+  const instances =
+    Object.hasOwn(settings.providerInstances, driver) || legacy === undefined
+      ? explicit
+      : [{ driver, config: legacy }, ...explicit];
+  return instances.map((instance) => ({
+    config: instance.config,
+    environment: instance.environment,
+    enabled: resolveProviderInstanceEnabled(instance),
+  }));
 }
 
 /** Resolve provider homes the way the spawned CLIs would see them. */
@@ -85,7 +108,8 @@ export const resolveSkillHomes = Effect.fn("resolveSkillHomes")(function* (input
   readonly platform: NodeJS.Platform;
 }): Effect.fn.Return<SkillHomes, never, Path.Path> {
   const path = yield* Path.Path;
-  const { settings, environment, platform } = input;
+  const { environment, platform } = input;
+  const settings = input.settings ?? DEFAULT_SERVER_SETTINGS;
   const home =
     (platform === "win32" ? environment.USERPROFILE : environment.HOME)?.trim() || NodeOS.homedir();
   const expand = (value: string) =>
@@ -98,21 +122,28 @@ export const resolveSkillHomes = Effect.fn("resolveSkillHomes")(function* (input
     );
 
   const codexHomes = new Set<string>();
-  const claudeConfigDirs = new Set<string>();
-  const codexInstances = settings ? instancesOf(settings, "codex") : [{}];
-  for (const instance of codexInstances) {
+  const enabledCodexHomes = new Set<string>();
+  for (const instance of instancesOf(settings, CODEX)) {
     const env = mergeProviderInstanceEnvironment(instance.environment, environment);
     const config = Option.getOrUndefined(decodeCodexSettings(instance.config ?? {}));
     const configured = config?.homePath.trim() || env.CODEX_HOME?.trim();
-    codexHomes.add(configured ? expand(configured) : path.join(home, ".codex"));
+    const codexHome = configured ? expand(configured) : path.join(home, ".codex");
+    codexHomes.add(codexHome);
+    if (instance.enabled) enabledCodexHomes.add(codexHome);
   }
-  const claudeInstances = settings ? instancesOf(settings, "claudeAgent") : [{}];
-  for (const instance of claudeInstances) {
+  const claudeConfigDirs = new Set<string>();
+  const enabledClaudeConfigDirs = new Set<string>();
+  for (const instance of instancesOf(settings, CLAUDE)) {
     const env = mergeProviderInstanceEnvironment(instance.environment, environment);
     const config = Option.getOrUndefined(decodeClaudeSettings(instance.config ?? {}));
     const configured = config?.homePath.trim() || env.CLAUDE_CONFIG_DIR?.trim();
-    claudeConfigDirs.add(configured ? expand(configured) : path.join(home, ".claude"));
+    const configDir = configured ? expand(configured) : path.join(home, ".claude");
+    claudeConfigDirs.add(configDir);
+    if (instance.enabled) enabledClaudeConfigDirs.add(configDir);
   }
+  // A driver with no instance at all, such as a fork's, still gets its folders scanned.
+  if (codexHomes.size === 0) codexHomes.add(path.join(home, ".codex"));
+  if (claudeConfigDirs.size === 0) claudeConfigDirs.add(path.join(home, ".claude"));
 
   const xdgConfig = environment.XDG_CONFIG_HOME?.trim();
   return {
@@ -124,6 +155,11 @@ export const resolveSkillHomes = Effect.fn("resolveSkillHomes")(function* (input
         ? path.join(xdgConfig, "opencode")
         : path.join(home, ".config", "opencode"),
     geminiHome: path.join(home, ".gemini"),
+    enabledCodexHomes: [...enabledCodexHomes],
+    enabledClaudeConfigDirs: [...enabledClaudeConfigDirs],
+    enabledProviders: [CODEX, CLAUDE, CURSOR, OPENCODE, ANTIGRAVITY, GROK, PI].filter((provider) =>
+      instancesOf(settings, provider).some((instance) => instance.enabled),
+    ),
   };
 });
 
@@ -207,6 +243,12 @@ export function projectSkillRoots(
   );
 }
 
+/** True when `folder` is where a provider looks for a project's skills, such as `<any>/.claude/skills`. */
+export function isProjectSkillFolder(folder: string): boolean {
+  const normalized = folder.replaceAll("\\", "/");
+  return PROJECT_SKILL_ROOTS.some(([relative]) => normalized.endsWith(`/${relative}`));
+}
+
 /** Shared mode writes new and imported skills here: the folder most providers read. */
 export const SHARED_PROJECT_SKILLS_DIR = [".agents", "skills"] as const;
 
@@ -234,11 +276,25 @@ export function projectInstructionFiles(path: Path.Path, projectRoot: string) {
  * Codex home is offered too, for a custom `CODEX_HOME` that does not read the
  * user's `.agents` folder. Links are per skill and skill names never start
  * with a dot, so Codex's `.system` folder is never touched.
+ *
+ * Each target names every provider that reads its folder, per
+ * `globalSkillRoots`, so a link into the literal `~/.codex/skills` also says
+ * it reaches Cursor while a custom Codex home does not.
  */
 export function skillLinkTargets(
   path: Path.Path,
   homes: SkillHomes,
 ): ReadonlyArray<SkillLinkTargetSpec> {
+  const readers = new Map(
+    globalSkillRoots(path, homes).map((root) => [root.path, root.providers] as const),
+  );
+  return linkTargetFolders(path, homes).map((target) => ({
+    ...target,
+    providers: readers.get(target.path) ?? target.providers,
+  }));
+}
+
+function linkTargetFolders(path: Path.Path, homes: SkillHomes): ReadonlyArray<SkillLinkTargetSpec> {
   return [
     {
       id: "agents",
@@ -267,6 +323,63 @@ export function skillLinkTargets(
       providers: [ANTIGRAVITY],
     },
   ];
+}
+
+/**
+ * The link target folders a global library skill needs so that every provider
+ * enabled in T3's settings reaches it, in `skillLinkTargets` order. `reached`
+ * holds the skill folders (as in `globalSkillRoots`) that already reach the
+ * skill, and `excluded` the target folders the user unlinked it from.
+ *
+ * Each enabled Codex home and Claude config dir gets its own folder: a custom
+ * `CODEX_HOME` is not assumed to read `~/.agents/skills`. Cursor, OpenCode,
+ * and Antigravity get their own folder only when no folder they read is
+ * reached or planned already, so a skill is not listed to them twice.
+ */
+export function planDefaultLinks(
+  path: Path.Path,
+  homes: SkillHomes,
+  input: { readonly reached: ReadonlySet<string>; readonly excluded: ReadonlySet<string> },
+): ReadonlyArray<string> {
+  const skillRoots = globalSkillRoots(path, homes).filter((root) => root.kind === "skills");
+  const readBy = (provider: ProviderDriverKind) =>
+    skillRoots.filter((root) => root.providers.includes(provider)).map((root) => root.path);
+  const enabled = new Set(homes.enabledProviders);
+  const defaultCodexHome = path.join(homes.home, ".codex");
+  const consumers: ReadonlyArray<{
+    readonly reads: ReadonlyArray<string>;
+    readonly target: string;
+  }> = [
+    ...homes.enabledCodexHomes.map((codexHome) => ({
+      reads: [
+        path.join(codexHome, "skills"),
+        ...(codexHome === defaultCodexHome ? [path.join(homes.home, ".agents", "skills")] : []),
+      ],
+      target: path.join(codexHome, "skills"),
+    })),
+    ...homes.enabledClaudeConfigDirs.map((dir) => ({
+      reads: [path.join(dir, "skills")],
+      target: path.join(dir, "skills"),
+    })),
+    ...(enabled.has(CURSOR)
+      ? [{ reads: readBy(CURSOR), target: path.join(homes.home, ".cursor", "skills") }]
+      : []),
+    ...(enabled.has(OPENCODE)
+      ? [{ reads: readBy(OPENCODE), target: path.join(homes.opencodeConfigDir, "skills") }]
+      : []),
+    ...(enabled.has(ANTIGRAVITY)
+      ? [{ reads: readBy(ANTIGRAVITY), target: path.join(homes.geminiHome, "config", "skills") }]
+      : []),
+  ];
+  const reached = new Set(input.reached);
+  const planned: Array<string> = [];
+  for (const consumer of consumers) {
+    if (consumer.reads.some((folder) => reached.has(folder))) continue;
+    if (input.excluded.has(consumer.target)) continue;
+    if (!planned.includes(consumer.target)) planned.push(consumer.target);
+    reached.add(consumer.target);
+  }
+  return planned;
 }
 
 /**
@@ -320,6 +433,7 @@ const LIMITATIONS: Partial<Record<string, ReadonlyArray<string>>> = {
   ],
   [CLAUDE]: [
     "Skills switched off with Claude Code's skillOverrides setting still show as enabled.",
+    "Claude Code switches skills off by name, so switching one off in a project also hides other skills with that name there.",
     "Claude Code does not read .agents/skills. In shared mode, link repository skills into .claude/skills to reach it.",
   ],
   [CURSOR]: [
@@ -335,6 +449,7 @@ const LIMITATIONS: Partial<Record<string, ReadonlyArray<string>>> = {
 };
 
 export function providerSupport(input: {
+  readonly enabledProviders: ReadonlyArray<ProviderDriverKind>;
   readonly globalRoots: ReadonlyArray<SkillRootSpec>;
   readonly linkTargets: ReadonlyArray<SkillLinkTargetSpec>;
   readonly instructionTargets: ReadonlyArray<SkillLinkTargetSpec>;
@@ -343,6 +458,7 @@ export function providerSupport(input: {
   const support = scanned.map((provider) => ({
     provider,
     scanned: true,
+    enabled: input.enabledProviders.includes(provider),
     globalRoots: input.globalRoots
       .filter((root) => root.providers.includes(provider))
       .map((root) => root.path),
@@ -360,6 +476,7 @@ export function providerSupport(input: {
   const reportedOnly = [GROK, PI].map((provider) => ({
     provider,
     scanned: false,
+    enabled: input.enabledProviders.includes(provider),
     globalRoots: [],
     projectRoots: [],
     linkTargetIds: [],

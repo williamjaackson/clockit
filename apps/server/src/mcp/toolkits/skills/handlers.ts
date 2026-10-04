@@ -66,4 +66,8 @@ export const SkillsHandlersLive = SkillsToolkit.toLayer({
   t3_skills_import_instructions: (input) => write((library) => library.importInstructions(input)),
   t3_skills_update_project_settings: (input) =>
     write((library) => library.updateProjectSettings(input)),
+  t3_skills_set_enabled_many: (input) => write((library) => library.setEnabledMany(input)),
+  t3_skills_reset_project: (input) => write((library) => library.resetProject(input)),
+  t3_skills_sync_providers: (input) => write((library) => library.syncProviders(input)),
+  t3_skills_release: (input) => write((library) => library.release(input)),
 });

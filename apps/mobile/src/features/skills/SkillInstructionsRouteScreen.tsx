@@ -7,11 +7,14 @@ import type {
 } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
+  instructionLinkTargets,
   isSkillsRevisionConflict,
-  PRIVATE_PROJECT_SUPPORT_NOTICE,
+  PRIVATE_PROJECT_SUMMARY,
   providerDisplayName,
+  SHARED_PROJECT_SUMMARY,
   sharedProfileNotice,
   skillsFailureMessage,
+  type SkillProviderSwitch,
 } from "@t3tools/client-runtime/state/skills";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -27,7 +30,7 @@ import { SettingsSection } from "../settings/components/SettingsSection";
 import { confirmSkillsAction, runSkillsCommand } from "./skills-commands";
 import {
   SkillFileEditorSection,
-  SkillLinkRows,
+  SkillProviderSwitchRows,
   SkillsDetailRow,
   SkillsNote,
   SkillsWarning,
@@ -192,7 +195,10 @@ export function SkillInstructionsRouteScreen({
   };
 
   const mode = snapshot?.instructions.mode ?? "inherit";
-  const files = shared ? [] : (snapshot?.instructions.files ?? []);
+  // Global provider files show up as "Use with" switches; only private mode lists files to import.
+  const files = projectPrivate
+    ? (snapshot?.instructions.files ?? []).filter((candidate) => candidate.exists)
+    : [];
 
   return (
     <SettingsScreen title="Instructions">
@@ -207,10 +213,7 @@ export function SkillInstructionsRouteScreen({
       >
         {shared ? (
           <>
-            <SkillsWarning
-              title="Edits files in the repository"
-              detail={snapshot?.scope.projectRoot ?? params.projectPath ?? ""}
-            />
+            <SkillsWarning title="Edits files in the repository" detail={SHARED_PROJECT_SUMMARY} />
             <SegmentedControl
               options={[
                 { value: "AGENTS.md", label: "AGENTS.md" },
@@ -249,9 +252,40 @@ export function SkillInstructionsRouteScreen({
             ))}
           </SettingsSection>
         ) : null}
-        {projectPrivate ? <SkillsNote>{PRIVATE_PROJECT_SUPPORT_NOTICE}</SkillsNote> : null}
+        {projectPrivate ? <SkillsNote>{PRIVATE_PROJECT_SUMMARY}</SkillsNote> : null}
+
+        {snapshot !== null && !projectPrivate && snapshot.instructions.links.length > 0 ? (
+          <>
+            <SettingsSection title="Use with">
+              <SkillProviderSwitchRows
+                environmentId={environmentId}
+                scope={scope}
+                subject={{ type: "instructions" }}
+                subjectLabel={shared ? "AGENTS.md" : "your instructions"}
+                links={snapshot.instructions.links}
+                linkTargets={instructionLinkTargets(snapshot.instructions)}
+                {...(shared
+                  ? {}
+                  : {
+                      onImportText: (row: SkillProviderSwitch) => {
+                        const source = snapshot.instructions.files.find(
+                          (candidate) => candidate.path === row.status.path,
+                        );
+                        if (source !== undefined) void importFile(source);
+                      },
+                    })}
+              />
+            </SettingsSection>
+            <SkillsNote>
+              {shared
+                ? "Claude Code reads CLAUDE.md, not AGENTS.md. Turn it on to have CLAUDE.md follow AGENTS.md in the repository."
+                : "Providers you turn on read these instructions instead of their own file. A provider that already has its own file keeps it until you replace it or import its text."}
+            </SkillsNote>
+          </>
+        ) : null}
 
         <SkillsNote>
+          {shared ? "Editing " : "Stored in "}
           {documentState.status === "ready"
             ? documentState.document.path
             : (snapshot?.instructions.canonicalPath ?? "")}
@@ -281,53 +315,20 @@ export function SkillInstructionsRouteScreen({
         )}
 
         {files.length > 0 ? (
-          <SettingsSection title={projectPrivate ? "Repository files" : "Provider files"}>
-            {files.map((candidate, index) => {
-              const importable = candidate.exists && !candidate.ownedLink;
-              return (
-                <SkillsDetailRow
-                  key={candidate.id}
-                  title={candidate.providers.map(providerDisplayName).join(", ") || "Repository"}
-                  detail={`${candidate.path}${
-                    candidate.ownedLink ? " · Linked" : candidate.exists ? "" : " · Missing"
-                  }`}
-                  borderTop={index > 0}
-                  {...(importable && !pending ? { onPress: () => void importFile(candidate) } : {})}
-                />
-              );
-            })}
+          <SettingsSection title="Start from a repository file">
+            {files.map((candidate, index) => (
+              <SkillsDetailRow
+                key={candidate.id}
+                title={candidate.path}
+                detail={`Read by ${candidate.providers.map(providerDisplayName).join(", ")}`}
+                borderTop={index > 0}
+                {...(pending ? {} : { onPress: () => void importFile(candidate) })}
+              />
+            ))}
           </SettingsSection>
         ) : null}
-        {files.some((candidate) => candidate.exists && !candidate.ownedLink) ? (
-          <SkillsNote>Tap a file to import its text into these instructions.</SkillsNote>
-        ) : null}
-
-        {snapshot !== null && !projectPrivate && snapshot.instructions.links.length > 0 ? (
-          <>
-            <SettingsSection title={shared ? "Repository links" : "Provider links"}>
-              <SkillLinkRows
-                environmentId={environmentId}
-                scope={scope}
-                subject={{ type: "instructions" }}
-                subjectLabel={shared ? "AGENTS.md" : "your instructions"}
-                links={snapshot.instructions.links}
-                providersFor={(targetId) => {
-                  const status = snapshot.instructions.links.find(
-                    (candidate) => candidate.targetId === targetId,
-                  );
-                  const providers =
-                    snapshot.instructions.files.find((candidate) => candidate.path === status?.path)
-                      ?.providers ?? [];
-                  return providers.map(providerDisplayName).join(", ") || targetId;
-                }}
-              />
-            </SettingsSection>
-            <SkillsNote>
-              {shared
-                ? "Claude Code reads CLAUDE.md, not AGENTS.md. Linking turns CLAUDE.md into a symlink to AGENTS.md in the repository, so both read the same file. Nothing is linked until you ask."
-                : "Link a provider's instruction file to these instructions so every provider reads the same text."}
-            </SkillsNote>
-          </>
+        {files.length > 0 ? (
+          <SkillsNote>Tap a file to import its text into your private instructions.</SkillsNote>
         ) : null}
       </ScrollView>
     </SettingsScreen>

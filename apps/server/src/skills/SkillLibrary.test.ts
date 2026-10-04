@@ -6,7 +6,12 @@ import * as NodeCrypto from "node:crypto";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
-import type { SkillEntry, SkillsSnapshot } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type SkillEntry,
+  type SkillsSnapshot,
+} from "@t3tools/contracts";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -29,9 +34,15 @@ import * as SkillLibrary from "./SkillLibrary.ts";
  * `faults.readLink` makes the service's `readLink` fail for one path, which
  * fails the snapshot at the end of a mutation after every change is made.
  * `faults.rename` fails renames onto matching paths, which is how atomic
- * writes land, so it fails one metadata write.
+ * writes land, so it fails one metadata write. `settings` defaults to T3's
+ * own, where Codex and Claude are enabled, so new global skills link to them.
  */
-const makeWorld = (options: { readonly env?: Record<string, string> } = {}) =>
+const makeWorld = (
+  options: {
+    readonly env?: Record<string, string>;
+    readonly settings?: Parameters<typeof ServerSettings.layerTest>[0];
+  } = {},
+) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -74,7 +85,10 @@ const makeWorld = (options: { readonly env?: Record<string, string> } = {}) =>
     const library = yield* Layer.build(
       SkillLibrary.layer.pipe(
         Layer.provide(
-          Layer.mergeAll(ServerConfig.layerTest(root, baseDir), ServerSettings.layerTest()),
+          Layer.mergeAll(
+            ServerConfig.layerTest(root, baseDir),
+            ServerSettings.layerTest(options.settings),
+          ),
         ),
       ),
     ).pipe(
@@ -156,6 +170,11 @@ const makeWorld = (options: { readonly env?: Record<string, string> } = {}) =>
       fingerprint,
     };
   });
+
+/** No provider enabled, so nothing links unless a test links it by hand. */
+const NO_PROVIDERS = {
+  providers: { codex: { enabled: false }, claudeAgent: { enabled: false } },
+} as const;
 
 const entryNamed = (
   snapshot: SkillsSnapshot,
@@ -312,7 +331,7 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
   describe("links", () => {
     it.effect("links one skill per target and never overwrites what it does not own", () =>
       Effect.gen(function* () {
-        const world = yield* makeWorld();
+        const world = yield* makeWorld({ settings: NO_PROVIDERS });
         const { path, home } = world;
         yield* world.writeSkill(path.join(home, ".claude/skills/neighbour"), "Neighbour");
         yield* world.writeSkill(path.join(home, ".codex/skills/.system/builtin"), "Bundled");
@@ -801,7 +820,7 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
 
     it.effect("provider folders that are one folder get a single link", () =>
       Effect.gen(function* () {
-        const world = yield* makeWorld();
+        const world = yield* makeWorld({ settings: NO_PROVIDERS });
         const { path, home } = world;
         yield* world.library.save({
           scope: {},
@@ -921,6 +940,42 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
         expect(listed.linkTargets.find((target) => target.id === "agents")?.providers).toEqual(
           expect.arrayContaining(["codex", "cursor", "opencode"]),
         );
+      }),
+    );
+
+    it.effect("names every reader of the default Codex and Claude folders", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+
+        const listed = yield* world.library.list({ scope: {} });
+        const providersOf = (id: string) =>
+          listed.linkTargets.find((target) => target.id === id)?.providers;
+
+        expect(providersOf("codex")).toEqual(["codex", "cursor"]);
+        expect(providersOf("claude")).toEqual(["claudeAgent", "cursor", "opencode"]);
+        expect(providersOf("cursor")).toEqual(["cursor"]);
+      }),
+    );
+
+    it.effect("names only the configured provider for custom homes", () =>
+      Effect.gen(function* () {
+        const outer = yield* makeWorld();
+        const world = yield* makeWorld({
+          env: {
+            CODEX_HOME: outer.path.join(outer.root, "codex-home"),
+            CLAUDE_CONFIG_DIR: outer.path.join(outer.root, "claude-home"),
+          },
+        });
+
+        const listed = yield* world.library.list({ scope: {} });
+        const providersOf = (id: string) =>
+          listed.linkTargets.find((target) => target.id === id)?.providers;
+
+        expect(providersOf("codex")).toEqual(["codex"]);
+        expect(providersOf("claude")).toEqual(["claudeAgent"]);
+        expect(
+          listed.providers.find((support) => support.provider === "cursor")?.linkTargetIds,
+        ).not.toContain("codex");
       }),
     );
   });
@@ -1906,6 +1961,620 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
 
         expect(read.files).toEqual(["SKILL.md", "docs/guide.md"]);
         expect(read.filesTruncated).toBe(false);
+      }),
+    );
+  });
+
+  describe("default links", () => {
+    it.effect("a new global skill reaches every enabled provider, each once", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, home } = world;
+        const canonical = path.join(world.baseDir, "skills/mine");
+
+        const saved = yield* world.library.save({
+          scope: {},
+          skill: { name: "mine" },
+          content: "---\ndescription: Mine\n---\n",
+          expectedRevision: null,
+        });
+
+        expect(saved.skippedLinks).toEqual([]);
+        expect(yield* world.readLink(path.join(home, ".codex/skills/mine"))).toBe(canonical);
+        expect(yield* world.readLink(path.join(home, ".claude/skills/mine"))).toBe(canonical);
+        // Codex already reads its own folder, and Cursor is not enabled.
+        expect(yield* world.exists(path.join(home, ".agents/skills/mine"))).toBe(false);
+        expect(yield* world.exists(path.join(home, ".cursor/skills/mine"))).toBe(false);
+        expect(
+          saved.snapshot.linkTargets.filter((target) => target.default).map((target) => target.id),
+        ).toEqual(["codex", "claude"]);
+        const enabled = Object.fromEntries(
+          saved.snapshot.providers.map((support) => [support.provider, support.enabled]),
+        );
+        expect(enabled).toMatchObject({ codex: true, claudeAgent: true, cursor: false });
+        const links = entryNamed(saved.snapshot, "mine", "managed").links;
+        expect(links.some((status) => status.syncPending)).toBe(false);
+      }),
+    );
+
+    it.effect("follows enabled instances, custom homes, and readers of shared folders", () =>
+      Effect.gen(function* () {
+        const outer = yield* makeWorld();
+        const workCodex = outer.path.join(outer.root, "work-codex");
+        const world = yield* makeWorld({
+          settings: {
+            providers: {
+              cursor: { enabled: true },
+              opencode: { enabled: true },
+              antigravity: { enabled: true },
+            },
+            providerInstances: {
+              [ProviderInstanceId.make("codex")]: {
+                driver: ProviderDriverKind.make("codex"),
+                enabled: false,
+              },
+              [ProviderInstanceId.make("codex-work")]: {
+                driver: ProviderDriverKind.make("codex"),
+                config: { homePath: workCodex },
+              },
+            },
+          },
+        });
+        const { path, home } = world;
+        const canonical = path.join(world.baseDir, "skills/mine");
+
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "mine" },
+          content: "x",
+          expectedRevision: null,
+        });
+
+        // The default Codex instance is off, so only the work home gets a link.
+        expect(yield* world.readLink(path.join(workCodex, "skills/mine"))).toBe(canonical);
+        expect(yield* world.exists(path.join(home, ".codex/skills/mine"))).toBe(false);
+        // Claude's folder also reaches Cursor and OpenCode; Antigravity needs its own.
+        expect(yield* world.readLink(path.join(home, ".claude/skills/mine"))).toBe(canonical);
+        expect(yield* world.exists(path.join(home, ".cursor/skills/mine"))).toBe(false);
+        expect(yield* world.exists(path.join(home, ".config/opencode/skills/mine"))).toBe(false);
+        expect(yield* world.readLink(path.join(home, ".gemini/config/skills/mine"))).toBe(
+          canonical,
+        );
+      }),
+    );
+
+    it.effect("skips occupied paths, remembers unlinks, and syncs only what is missing", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, home } = world;
+        const canonical = path.join(world.baseDir, "skills/mine");
+        const claudePath = path.join(home, ".claude/skills/mine");
+        const codexPath = path.join(home, ".codex/skills/mine");
+        yield* world.writeSkill(claudePath, "Somebody else's");
+
+        const saved = yield* world.library.save({
+          scope: {},
+          skill: { name: "mine" },
+          content: "x",
+          expectedRevision: null,
+        });
+        expect(saved.skippedLinks).toEqual([claudePath]);
+        expect(yield* world.read(path.join(claudePath, "SKILL.md"))).toContain("Somebody else's");
+        const claudeStatus = entryNamed(saved.snapshot, "mine", "managed").links.find(
+          (status) => status.targetId === "claude",
+        );
+        expect(claudeStatus).toMatchObject({ state: "occupied", syncPending: true });
+
+        yield* world.library.unlink({
+          subject: { type: "skill", name: "mine" },
+          targetIds: ["codex"],
+        });
+        yield* world.fileSystem.remove(claudePath, { recursive: true });
+        const synced = yield* world.library.syncProviders({});
+
+        // The unlinked Codex folder stays as the user left it.
+        expect(synced.linked).toEqual([claudePath]);
+        expect(yield* world.exists(codexPath)).toBe(false);
+        const codexStatus = entryNamed(synced.snapshot, "mine", "managed").links.find(
+          (status) => status.targetId === "codex",
+        );
+        expect(codexStatus).toMatchObject({ state: "available", excluded: true });
+        expect(codexStatus?.syncPending).toBeUndefined();
+
+        yield* world.library.link({
+          subject: { type: "skill", name: "mine" },
+          targetIds: ["codex"],
+        });
+        const relisted = yield* world.library.list({ scope: {} });
+        expect(
+          entryNamed(relisted, "mine", "managed").links.find(
+            (status) => status.targetId === "codex",
+          )?.excluded,
+        ).toBeUndefined();
+        expect(yield* world.readLink(codexPath)).toBe(canonical);
+      }),
+    );
+
+    it.effect("sync links older skills without touching links the user made", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, home } = world;
+        // A skill from before default links, reached only through the user's own link.
+        yield* world.writeSkill(path.join(world.baseDir, "skills/older"), "Older");
+        const userLink = path.join(home, ".agents/skills/older");
+        yield* world.symlink(path.join(world.baseDir, "skills/older"), userLink);
+        yield* world.writeSkill(path.join(world.baseDir, "disabled-skills/off"), "Off");
+
+        const before = yield* world.library.list({ scope: {} });
+        const pending = entryNamed(before, "older", "managed")
+          .links.filter((status) => status.syncPending)
+          .map((status) => status.targetId);
+        // Codex reads ~/.agents/skills already; Claude does not.
+        expect(pending).toEqual(["claude"]);
+
+        const synced = yield* world.library.syncProviders({});
+
+        expect(synced.linked).toEqual([path.join(home, ".claude/skills/older")]);
+        expect(yield* world.readLink(userLink)).toBe(path.join(world.baseDir, "skills/older"));
+        expect(yield* world.exists(path.join(home, ".claude/skills/off"))).toBe(false);
+        const off = yield* world.library.syncProviders({ names: ["off"] }).pipe(Effect.flip);
+        expect(off.reason).toBe("unsupported");
+      }),
+    );
+  });
+
+  describe("project inheritance", () => {
+    it.effect("a project lists the global library read-only and switches it privately", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, home, project } = world;
+        const scope = { projectPath: project };
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "review" },
+          content: "---\nname: review\ndescription: Review\n---\nGlobal\n",
+          expectedRevision: null,
+        });
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "dormant" },
+          content: "x",
+          expectedRevision: null,
+        });
+        yield* world.library.setEnabled({ scope: {}, skill: { name: "dormant" }, enabled: false });
+        const globalBefore = yield* world.fingerprint(world.baseDir);
+        const homeBefore = yield* world.fingerprint(home);
+
+        const listed = yield* world.library.list({ scope });
+        const review = listed.entries.find((entry) => entry.id === "inherited:review")!;
+        expect(review).toMatchObject({
+          scope: "global",
+          ownership: "managed",
+          enabled: true,
+          editable: false,
+          globallyEnabled: true,
+          projectDisabled: false,
+        });
+        expect(review.providers).toEqual(expect.arrayContaining(["codex", "claudeAgent"]));
+        expect(listed.entries.find((entry) => entry.id === "inherited:dormant")).toMatchObject({
+          enabled: false,
+          globallyEnabled: false,
+        });
+
+        const switched = yield* world.library.setEnabled({
+          scope,
+          skill: { entryId: "inherited:review" },
+          enabled: false,
+        });
+        expect(
+          switched.snapshot.entries.find((entry) => entry.id === "inherited:review"),
+        ).toMatchObject({ enabled: false, projectDisabled: true, globallyEnabled: true });
+        // Only the private manifest changed: the library and provider folders did not.
+        const globalAfter = yield* world.fingerprint(world.baseDir);
+        expect(
+          Object.keys(globalAfter).filter((entry) => !entry.startsWith("skill-projects")),
+        ).toEqual(Object.keys(globalBefore));
+        expect(yield* world.fingerprint(home)).toEqual(homeBefore);
+        expect(
+          entryNamed(yield* world.library.list({ scope: {} }), "review", "managed").enabled,
+        ).toBe(true);
+
+        const overlay = Option.getOrThrow(yield* world.library.resolveProjectOverlay(project));
+        const canonical = path.join(world.baseDir, "skills/review");
+        expect(overlay.suppressedRepoSkills).toEqual([
+          {
+            name: "review",
+            folderName: "review",
+            path: canonical,
+            aliases: [
+              path.join(home, ".codex/skills/review"),
+              path.join(home, ".claude/skills/review"),
+            ],
+            reason: "disabled",
+          },
+        ]);
+
+        const fakeOn = yield* world.library
+          .setEnabled({ scope, skill: { entryId: "inherited:dormant" }, enabled: true })
+          .pipe(Effect.flip);
+        expect(fakeOn.reason).toBe("unsupported");
+        const edit = yield* world.library
+          .save({
+            scope,
+            skill: { entryId: "inherited:review" },
+            content: "Edited here",
+            expectedRevision: null,
+          })
+          .pipe(Effect.flip);
+        expect(edit.reason).toBe("readOnly");
+        expect(yield* world.read(path.join(canonical, "SKILL.md"))).toContain("Global");
+      }),
+    );
+
+    it.effect("a private copy replaces the inherited skill and leaves the original alone", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        const scope = { projectPath: project };
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "review" },
+          content: "Global",
+          expectedRevision: null,
+        });
+
+        const imported = yield* world.library.importSkill({ scope, entryId: "inherited:review" });
+        yield* world.library.save({
+          scope,
+          skill: { name: "review" },
+          content: "Private",
+          expectedRevision: (yield* world.library.read({ scope, skill: { name: "review" } }))
+            .revision,
+        });
+
+        expect(imported.path.startsWith(path.join(world.baseDir, "skill-projects"))).toBe(true);
+        expect(yield* world.read(path.join(world.baseDir, "skills/review/SKILL.md"))).toBe(
+          "Global",
+        );
+        const listed = yield* world.library.list({ scope });
+        const inherited = listed.entries.find((entry) => entry.id === "inherited:review")!;
+        expect(inherited.enabled).toBe(false);
+        expect(inherited.projectDisabled).toBe(false);
+        expect(inherited.conflicts).toEqual([
+          { entryId: "managed:review", path: expect.any(String), reason: "replacedByLocal" },
+        ]);
+        expect(listed.entries.find((entry) => entry.id === "managed:review")?.enabled).toBe(true);
+        // A private name ref never reaches the global library.
+        yield* world.library.setEnabled({ scope, skill: { name: "review" }, enabled: false });
+        expect(yield* world.exists(path.join(world.baseDir, "skills/review/SKILL.md"))).toBe(true);
+      }),
+    );
+
+    it.effect("reads manifests written before global switches existed", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        yield* world.writeSkill(path.join(project, ".agents/skills/lint"), "Lint");
+        yield* world.write(
+          path.join(
+            world.baseDir,
+            "skill-projects",
+            NodeCrypto.createHash("sha256").update(project).digest("hex").slice(0, 16),
+            "manifest.json",
+          ),
+          `{"version":1,"projectRoot":"${project}","disabledRepoSkills":[".agents/skills/lint"],"instructionMode":"inherit","globalInstructionsEnabled":true}`,
+        );
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "g" },
+          content: "x",
+          expectedRevision: null,
+        });
+
+        const listed = yield* world.library.list({ scope: { projectPath: project } });
+        expect(entryNamed(listed, "lint")).toMatchObject({ enabled: false, projectDisabled: true });
+        expect(listed.entries.find((entry) => entry.id === "inherited:g")?.enabled).toBe(true);
+
+        yield* world.library.setEnabled({
+          scope: { projectPath: project },
+          skill: { entryId: "inherited:g" },
+          enabled: false,
+        });
+        const overlay = Option.getOrThrow(yield* world.library.resolveProjectOverlay(project));
+        expect(overlay.suppressedRepoSkills.map((entry) => entry.name).toSorted()).toEqual([
+          "g",
+          "lint",
+        ]);
+      }),
+    );
+
+    it.effect("switches several skills at once, all or nothing", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        const scope = { projectPath: project };
+        yield* world.writeSkill(path.join(project, ".agents/skills/one"), "One");
+        yield* world.writeSkill(path.join(project, ".agents/skills/two"), "Two");
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "g" },
+          content: "x",
+          expectedRevision: null,
+        });
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "off" },
+          content: "x",
+          expectedRevision: null,
+        });
+        yield* world.library.setEnabled({ scope: {}, skill: { name: "off" }, enabled: false });
+        const listed = yield* world.library.list({ scope });
+
+        const changed = yield* world.library.setEnabledMany({
+          scope,
+          skills: [{ entryId: entryNamed(listed, "one").id }, { entryId: "inherited:g" }],
+          enabled: false,
+        });
+        expect(entryNamed(changed.snapshot, "one").enabled).toBe(false);
+        expect(changed.snapshot.entries.find((entry) => entry.id === "inherited:g")?.enabled).toBe(
+          false,
+        );
+
+        const refused = yield* world.library
+          .setEnabledMany({
+            scope,
+            skills: [{ entryId: entryNamed(listed, "one").id }, { entryId: "inherited:off" }],
+            enabled: true,
+          })
+          .pipe(Effect.flip);
+        expect(refused.reason).toBe("unsupported");
+        expect(entryNamed(yield* world.library.list({ scope }), "one").enabled).toBe(false);
+
+        const globalBatch = yield* world.library.setEnabledMany({
+          scope: {},
+          skills: [{ name: "g" }, { name: "off" }],
+          enabled: false,
+        });
+        expect(
+          globalBatch.snapshot.entries.filter(
+            (entry) => entry.ownership === "managed" && entry.enabled,
+          ),
+        ).toEqual([]);
+      }),
+    );
+
+    it.effect("reset clears only the chosen sections and keeps private skills", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        const scope = { projectPath: project };
+        yield* world.writeSkill(path.join(project, ".agents/skills/lint"), "Lint");
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "g" },
+          content: "x",
+          expectedRevision: null,
+        });
+        yield* world.library.save({
+          scope,
+          skill: { name: "mine" },
+          content: "x",
+          expectedRevision: null,
+        });
+        const listed = yield* world.library.list({ scope });
+        yield* world.library.setEnabledMany({
+          scope,
+          skills: [
+            { entryId: entryNamed(listed, "lint").id },
+            { entryId: "inherited:g" },
+            { name: "mine" },
+          ],
+          enabled: false,
+        });
+
+        const reset = yield* world.library.resetProject({
+          projectPath: project,
+          sections: ["inherited"],
+        });
+
+        expect(reset.inherited).toEqual(["g"]);
+        expect(reset.repository).toEqual([]);
+        expect(reset.snapshot.entries.find((entry) => entry.id === "inherited:g")?.enabled).toBe(
+          true,
+        );
+        expect(entryNamed(reset.snapshot, "lint").enabled).toBe(false);
+        expect(reset.snapshot.entries.find((entry) => entry.id === "managed:mine")?.enabled).toBe(
+          false,
+        );
+
+        const fresh = yield* world.library.resetProject({
+          projectPath: path.join(project, ".agents"),
+          sections: ["inherited", "repository"],
+        });
+        expect(fresh.inherited).toEqual([]);
+      }),
+    );
+
+    it.effect("a project's switch survives the global skill leaving and coming back", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { project } = world;
+        const scope = { projectPath: project };
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "g" },
+          content: "x",
+          expectedRevision: null,
+        });
+        yield* world.library.setEnabled({
+          scope,
+          skill: { entryId: "inherited:g" },
+          enabled: false,
+        });
+
+        const archived = yield* world.library.archive({ scope: {}, name: "g" });
+        const gone = yield* world.library.list({ scope });
+        expect(gone.entries.some((entry) => entry.id === "inherited:g")).toBe(false);
+        expect(Option.isNone(yield* world.library.resolveProjectOverlay(project))).toBe(true);
+
+        yield* world.library.restore({ scope: {}, recoveryId: archived.recovery.id });
+        const back = yield* world.library.list({ scope });
+        expect(back.entries.find((entry) => entry.id === "inherited:g")).toMatchObject({
+          enabled: false,
+          projectDisabled: true,
+        });
+      }),
+    );
+  });
+
+  describe("release", () => {
+    it.effect("keeps the latest files and every provider that had the skill", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, home } = world;
+        const original = path.join(home, ".claude/skills/tool");
+        yield* world.writeSkill(original, "Original");
+        const adopted = yield* world.library.importSkill({
+          scope: {},
+          entryId: entryNamed(yield* world.library.list({ scope: {} }), "tool").id,
+          adoptOriginal: true,
+        });
+        const canonical = path.join(world.baseDir, "skills/tool");
+        yield* world.write(path.join(canonical, "SKILL.md"), "---\ndescription: Latest\n---\n");
+        yield* world.write(path.join(canonical, "scripts/run.sh"), "echo latest\n");
+        const latest = yield* world.fingerprint(canonical);
+        const codexPath = path.join(home, ".codex/skills/tool");
+        expect(yield* world.readLink(codexPath)).toBe(canonical);
+        const homeBefore = yield* world.fingerprint(home);
+
+        const preview = yield* world.library.release({ name: "tool", dryRun: true });
+        expect(preview).toMatchObject({
+          destination: codexPath,
+          wasEnabled: true,
+          relinked: [original],
+          released: false,
+        });
+        expect(yield* world.fingerprint(home)).toEqual(homeBefore);
+
+        const released = yield* world.library.release({ name: "tool", destination: codexPath });
+
+        expect(released.released).toBe(true);
+        expect(yield* world.readLink(codexPath)).toBeUndefined();
+        expect(yield* world.fingerprint(codexPath)).toEqual(latest);
+        expect(yield* world.readLink(original)).toBe(codexPath);
+        expect(yield* world.exists(canonical)).toBe(false);
+        const entry = entryNamed(released.snapshot, "tool");
+        expect(entry.ownership).toBe("unmanaged");
+        expect(entry.providers).toEqual(expect.arrayContaining(["codex", "claudeAgent", "cursor"]));
+
+        // The original from before adoption cannot overwrite the released folder.
+        const restore = yield* world.library
+          .restore({ scope: {}, recoveryId: adopted.recovery[0]!.id })
+          .pipe(Effect.flip);
+        expect(restore.reason).toBe("conflict");
+        expect(yield* world.fingerprint(codexPath)).toEqual(latest);
+        expect(released.snapshot.recovery.map((item) => item.id)).toEqual([
+          adopted.recovery[0]!.id,
+        ]);
+
+        // The name is free again, so the skill can be adopted back.
+        const readopted = yield* world.library.importSkill({
+          scope: {},
+          entryId: entry.id,
+          adoptOriginal: true,
+        });
+        expect(yield* world.fingerprint(readopted.path)).toEqual(latest);
+      }),
+    );
+
+    it.effect("a disabled skill goes only to a folder no provider reads", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, home } = world;
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "off" },
+          content: "Latest",
+          expectedRevision: null,
+        });
+        yield* world.library.setEnabled({ scope: {}, skill: { name: "off" }, enabled: false });
+
+        const noDestination = yield* world.library.release({ name: "off" }).pipe(Effect.flip);
+        expect(noDestination.reason).toBe("unsupported");
+        const native = yield* world.library
+          .release({ name: "off", destination: path.join(home, ".agents/skills/off") })
+          .pipe(Effect.flip);
+        expect(native.reason).toBe("unsupported");
+        const inRepo = yield* world.library
+          .release({ name: "off", destination: path.join(world.project, ".claude/skills/off") })
+          .pipe(Effect.flip);
+        expect(inRepo.reason).toBe("unsupported");
+        const inStorage = yield* world.library
+          .release({ name: "off", destination: path.join(world.baseDir, "skills/off") })
+          .pipe(Effect.flip);
+        expect(inStorage.reason).toBe("invalidPath");
+
+        const exported = path.join(home, "exports/off");
+        const released = yield* world.library.release({ name: "off", destination: exported });
+
+        expect(released).toMatchObject({ wasEnabled: false, relinked: [], released: true });
+        expect(yield* world.read(path.join(exported, "SKILL.md"))).toBe("Latest");
+        expect(yield* world.exists(path.join(world.baseDir, "disabled-skills/off"))).toBe(false);
+        expect(released.snapshot.entries.some((entry) => entry.name === "off")).toBe(false);
+        // Nothing remembers links to put back for a skill T3 no longer manages.
+        expect(yield* world.read(path.join(world.baseDir, "skill-library.json"))).not.toContain(
+          '"off"',
+        );
+      }),
+    );
+
+    it.effect("refuses when a provider folder links to the whole library", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, home } = world;
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "mine" },
+          content: "x",
+          expectedRevision: null,
+        });
+        const wholeFolder = path.join(home, ".cursor/skills");
+        yield* world.symlink(path.join(world.baseDir, "skills"), wholeFolder);
+        const before = yield* world.fingerprint(world.baseDir);
+
+        const refused = yield* world.library.release({ name: "mine" }).pipe(Effect.flip);
+
+        expect(refused.reason).toBe("conflict");
+        expect(refused.conflictPaths).toEqual([path.join(wholeFolder, "mine")]);
+        expect(yield* world.fingerprint(world.baseDir)).toEqual(before);
+      }),
+    );
+
+    it.effect("a late failure puts the skill and its links back", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, home } = world;
+        const canonical = path.join(world.baseDir, "skills/mine");
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "mine" },
+          content: "x",
+          expectedRevision: null,
+        });
+        // An unlink leaves state to clear, so the release ends with a metadata write.
+        yield* world.library.unlink({
+          subject: { type: "skill", name: "mine" },
+          targetIds: ["claude"],
+        });
+        const before = yield* world.fingerprint(world.root);
+        world.faults.rename = (to) => to === path.join(world.baseDir, "skill-library.json");
+
+        const failure = yield* world.library.release({ name: "mine" }).pipe(Effect.flip);
+
+        delete world.faults.rename;
+        expect(failure.reason).toBe("filesystem");
+        expect(yield* world.readLink(path.join(home, ".codex/skills/mine"))).toBe(canonical);
+        expect(yield* world.fingerprint(world.root)).toEqual(before);
       }),
     );
   });

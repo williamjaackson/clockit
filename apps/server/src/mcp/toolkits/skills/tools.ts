@@ -14,13 +14,20 @@ import {
   SkillsReadInstructionsInput,
   SkillsReadResult,
   SkillsRecoveryInput,
+  SkillsReleaseInput,
+  SkillsReleaseResult,
+  SkillsResetProjectInput,
+  SkillsResetProjectResult,
   SkillsRestoreResult,
   SkillsSaveInput,
   SkillsSaveInstructionsInput,
   SkillsSaveResult,
   SkillsSetEnabledInput,
+  SkillsSetEnabledManyInput,
   SkillsSetEnabledResult,
   SkillsSnapshot,
+  SkillsSyncProvidersInput,
+  SkillsSyncProvidersResult,
   SkillsUnlinkInput,
   SkillsUnlinkResult,
   SkillsUpdateProjectSettingsInput,
@@ -81,6 +88,30 @@ const SkillsSetEnabledTool = Tool.make("t3_skills_set_enabled", {
   description: `Enable or disable a skill for this scope. Disabling a global library skill removes only T3's links and enabling puts them back; skippedLinks lists paths something else now occupies. ${MUTATION}`,
   parameters: SkillsSetEnabledInput,
   success: SkillsSetEnabledResult,
+}).annotate(Tool.Destructive, true);
+const SkillsSetEnabledManyTool = Tool.make("t3_skills_set_enabled_many", {
+  ...shared,
+  description: `Enable or disable several skills of one scope together; either every one changes or none do. In a project scope, inherited:<name> entries switch a global library skill off for that project only, and one that is off globally cannot be switched on there. ${MUTATION}`,
+  parameters: SkillsSetEnabledManyInput,
+  success: SkillsSetEnabledResult,
+}).annotate(Tool.Destructive, true);
+const SkillsResetProjectTool = Tool.make("t3_skills_reset_project", {
+  ...shared,
+  description: `Switch a project's inherited global skills and/or repository skills back on by clearing its private switches for the named sections. Private skills are left alone. ${MUTATION}`,
+  parameters: SkillsResetProjectInput,
+  success: SkillsResetProjectResult,
+}).annotate(Tool.Destructive, true);
+const SkillsSyncProvidersTool = Tool.make("t3_skills_sync_providers", {
+  ...shared,
+  description: `Link enabled global library skills into the default provider folders they do not reach yet, so every provider enabled in T3 gets them. Never removes or replaces anything, and skips folders the user unlinked a skill from; skippedLinks lists occupied paths. ${MUTATION}`,
+  parameters: SkillsSyncProvidersInput,
+  success: SkillsSyncProvidersResult,
+}).annotate(Tool.Destructive, true);
+const SkillsReleaseTool = Tool.make("t3_skills_release", {
+  ...shared,
+  description: `Stop managing a global library skill: move its current folder to destination and repoint T3's links there, so the same providers keep it. Run with dryRun:true first and show the user the destination. A disabled skill needs a destination outside every provider skill folder. ${MUTATION}`,
+  parameters: SkillsReleaseInput,
+  success: SkillsReleaseResult,
 }).annotate(Tool.Destructive, true);
 const SkillsArchiveTool = Tool.make("t3_skills_archive", {
   ...shared,
@@ -154,4 +185,8 @@ export const SkillsToolkit = Toolkit.make(
   SkillsSaveInstructionsTool,
   SkillsImportInstructionsTool,
   SkillsUpdateProjectSettingsTool,
+  SkillsSetEnabledManyTool,
+  SkillsResetProjectTool,
+  SkillsSyncProvidersTool,
+  SkillsReleaseTool,
 );

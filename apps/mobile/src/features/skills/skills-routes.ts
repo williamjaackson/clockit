@@ -20,6 +20,7 @@ export type SkillsRoutes = {
   SettingsSkillInstructions: SkillsScopeParams;
   SettingsSkillNew: SkillsScopeParams;
   SettingsSkillImport: SkillsScopeParams & { readonly entryId: string };
+  SettingsSkillRelease: SkillsScopeParams & { readonly entryId: string };
 };
 
 export function selectionFromParams(params: SkillsScopeParams): SkillsScopeSelection {

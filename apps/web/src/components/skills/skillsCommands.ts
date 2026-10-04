@@ -25,6 +25,24 @@ export async function runSkillsCommand<A, E>(
   return null;
 }
 
+/**
+ * Creating, importing, or syncing a My skills entry leaves alone any agent
+ * folder that already holds something of that name. Says so briefly; the
+ * skill's own page lists the paths.
+ */
+export function reportSkippedLinks(skippedLinks: ReadonlyArray<string> | undefined) {
+  if (skippedLinks === undefined || skippedLinks.length === 0) return;
+  toastManager.add({
+    type: "warning",
+    title:
+      skippedLinks.length === 1
+        ? "One agent folder already had a skill with this name"
+        : `${skippedLinks.length} agent folders already had a skill with these names`,
+    description:
+      "T3 left them alone, so those agents keep their own copy. Open the skill to see where.",
+  });
+}
+
 export async function confirmSkillsAction(
   message: string,
   variant: "default" | "destructive" = "default",

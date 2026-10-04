@@ -8,14 +8,25 @@ import * as Cause from "effect/Cause";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  filterSkillEntries,
+  canResetSection,
+  discoverableSkills,
   findScopeLibraryEntry,
+  invocationNameClashes,
   newSkillContent,
+  providerSyncNames,
   sharedProfileNotice,
+  skillAdoptionPlan,
+  skillAgentProviders,
+  skillBulkEntries,
   skillLinkAction,
+  skillProviderReach,
+  skillProviderSwitches,
+  skillReachLabel,
   skillScope,
+  skillSections,
   skillsFailureMessage,
   skillsScopeKey,
+  skillToggle,
   validateNewSkillName,
 } from "./skills.ts";
 
@@ -37,53 +48,380 @@ function entry(overrides: Partial<SkillEntry> & Pick<SkillEntry, "name">): Skill
 
 const claude = ProviderDriverKind.make("claudeAgent");
 const codex = ProviderDriverKind.make("codex");
+const cursor = ProviderDriverKind.make("cursor");
+const opencode = ProviderDriverKind.make("opencode");
+const grok = ProviderDriverKind.make("grok");
 
-describe("filterSkillEntries", () => {
+const GLOBAL_SCOPE = { kind: "global", libraryPath: "/home/me/.t3/skills" } as const;
+const PRIVATE_SCOPE = {
+  kind: "project",
+  mode: "local",
+  projectRoot: "/repo",
+  libraryPath: "/home/me/.t3/skill-projects/abc/skills",
+} as const;
+const SHARED_SCOPE = {
+  kind: "project",
+  mode: "shared",
+  projectRoot: "/repo",
+  libraryPath: "/repo/.agents/skills",
+} as const;
+
+function support(
+  provider: ProviderDriverKind,
+  options: { readonly enabled?: boolean; readonly scanned?: boolean } = {},
+): SkillsSnapshot["providers"][number] {
+  return {
+    provider,
+    scanned: options.scanned ?? true,
+    ...(options.enabled === undefined ? {} : { enabled: options.enabled }),
+    globalRoots: [],
+    projectRoots: [],
+    linkTargetIds: [],
+    instructionTargetIds: [],
+    limitations: [],
+  };
+}
+
+function makeSnapshot(
+  scope: SkillsSnapshot["scope"],
+  entries: ReadonlyArray<SkillEntry>,
+  extra: Partial<SkillsSnapshot> = {},
+): SkillsSnapshot {
+  return {
+    scope,
+    entries,
+    linkTargets: [],
+    providers: [],
+    instructions: { canonicalPath: "/x/AGENTS.md", canonicalExists: false, files: [], links: [] },
+    recovery: [],
+    warnings: [],
+    ...extra,
+  };
+}
+
+const inherited = (name: string, overrides: Partial<SkillEntry> = {}) =>
+  entry({
+    id: `inherited:${name}`,
+    name,
+    editable: false,
+    globallyEnabled: true,
+    projectDisabled: false,
+    ...overrides,
+  });
+const repository = (name: string, overrides: Partial<SkillEntry> = {}) =>
+  entry({
+    id: `repo-${name}`,
+    name,
+    scope: "project",
+    ownership: "unmanaged",
+    editable: false,
+    path: `/repo/.claude/skills/${name}`,
+    projectDisabled: false,
+    ...overrides,
+  });
+const privateSkill = (name: string, overrides: Partial<SkillEntry> = {}) =>
+  entry({ name, scope: "project", ...overrides });
+
+describe("skillSections", () => {
+  it("lists only T3's skills in My skills and offers user skills to take over", () => {
+    const snapshot = makeSnapshot(GLOBAL_SCOPE, [
+      entry({ name: "review", description: "Review pull requests" }),
+      entry({ id: "u1", name: "notes", ownership: "unmanaged" }),
+      entry({ id: "p1", name: "pdf", ownership: "plugin", pluginId: "docs" }),
+      entry({ id: "s1", name: "imagegen", ownership: "system" }),
+    ]);
+    const sections = skillSections(snapshot, { query: "", filter: "all" });
+    expect(sections.map((section) => [section.id, section.entries.map((e) => e.name)])).toEqual([
+      ["mine", ["review"]],
+    ]);
+    expect(discoverableSkills(snapshot).map((e) => e.name)).toEqual(["notes"]);
+  });
+
+  it("keeps an empty My skills section so the page can point at existing skills", () => {
+    const sections = skillSections(makeSnapshot(GLOBAL_SCOPE, []), { query: "", filter: "all" });
+    expect(sections).toHaveLength(1);
+    expect(sections[0]?.entries).toEqual([]);
+  });
+
+  it("groups a project into inherited, repository, and private skills", () => {
+    const snapshot = makeSnapshot(PRIVATE_SCOPE, [
+      inherited("review"),
+      inherited("legacy", { enabled: false, globallyEnabled: false }),
+      repository("deploy"),
+      privateSkill("notes"),
+    ]);
+    const sections = skillSections(snapshot, { query: "", filter: "all" });
+    expect(sections.map((section) => [section.id, section.entries.map((e) => e.name)])).toEqual([
+      ["inherited", ["review"]],
+      ["repository", ["deploy"]],
+      ["private", ["notes"]],
+    ]);
+    expect(sections[0]?.offInMySkills).toBe(1);
+    expect(sections[0]?.all.map((e) => e.name)).toEqual(["legacy", "review"]);
+
+    const revealed = skillSections(snapshot, {
+      query: "",
+      filter: "all",
+      showOffInMySkills: true,
+    });
+    expect(revealed[0]?.entries.map((e) => e.name)).toEqual(["legacy", "review"]);
+  });
+
+  it("searches names, frontmatter names, descriptions, and agents", () => {
+    const snapshot = makeSnapshot(GLOBAL_SCOPE, [
+      entry({ name: "review", description: "Review pull requests", providers: [claude] }),
+      entry({ name: "ship", invocationName: "deploy-prod", providers: [codex] }),
+    ]);
+    const names = (query: string) =>
+      skillSections(snapshot, { query, filter: "all" })[0]?.entries.map((e) => e.name);
+    expect(names("pull")).toEqual(["review"]);
+    expect(names("deploy")).toEqual(["ship"]);
+    expect(names("codex ship")).toEqual(["ship"]);
+    expect(names("codex review")).toEqual([]);
+  });
+});
+
+describe("skillToggle", () => {
+  it("never offers a switch for plugin, built-in, unmanaged user, or repository-file skills", () => {
+    expect(skillToggle(entry({ name: "a", ownership: "plugin" }), GLOBAL_SCOPE)).toBeNull();
+    expect(skillToggle(entry({ name: "a", ownership: "system" }), GLOBAL_SCOPE)).toBeNull();
+    expect(skillToggle(entry({ name: "a", ownership: "unmanaged" }), GLOBAL_SCOPE)).toBeNull();
+    expect(skillToggle(repository("a"), SHARED_SCOPE)).toBeNull();
+  });
+
+  it("can't switch an inherited skill on in a project while it is off in My skills", () => {
+    const toggle = skillToggle(
+      inherited("a", { enabled: false, globallyEnabled: false }),
+      PRIVATE_SCOPE,
+    );
+    expect(toggle?.checked).toBe(false);
+    expect(toggle?.disabledReason).toContain("My skills");
+  });
+
+  it("locks a skill a private skill replaces", () => {
+    const replaced = repository("a", {
+      enabled: false,
+      conflicts: [{ entryId: "managed:a", path: "/p/a", reason: "replacedByLocal" }],
+    });
+    expect(skillToggle(replaced, PRIVATE_SCOPE)?.disabledReason).not.toBeNull();
+    expect(
+      skillToggle(inherited("b", { projectDisabled: true, enabled: false }), PRIVATE_SCOPE),
+    ).toEqual({ checked: false, disabledReason: null });
+  });
+});
+
+describe("skillBulkEntries and canResetSection", () => {
   const entries = [
-    entry({
-      name: "review",
-      description: "Review pull requests",
-      providers: [claude],
-      links: [{ targetId: "claude", path: "/home/me/.claude/skills/review", state: "linked" }],
-    }),
-    entry({ name: "deploy", providers: [codex], links: [] }),
-    entry({
-      id: "abc",
-      name: "pdf",
-      ownership: "plugin",
-      editable: false,
-      providers: [claude],
-      conflicts: [{ entryId: "def", path: "/elsewhere/pdf", reason: "duplicateName" }],
-    }),
-    entry({ id: "ghi", name: "old", ownership: "unmanaged", enabled: false }),
+    inherited("on"),
+    inherited("off-here", { enabled: false, projectDisabled: true }),
+    inherited("off-globally", { enabled: false, globallyEnabled: false }),
   ];
 
-  it("matches every search word against name, description, and provider", () => {
-    expect(
-      filterSkillEntries(entries, { query: "pull", filter: "all" }).map((e) => e.name),
-    ).toEqual(["review"]);
-    expect(
-      filterSkillEntries(entries, { query: "codex deploy", filter: "all" }).map((e) => e.name),
-    ).toEqual(["deploy"]);
-    expect(filterSkillEntries(entries, { query: "codex review", filter: "all" })).toEqual([]);
+  it("switches only skills that can change and are not already there", () => {
+    const ids = (enabled: boolean) =>
+      skillBulkEntries(entries, PRIVATE_SCOPE, enabled).map((e) => e.id);
+    expect(ids(true)).toEqual(["inherited:off-here"]);
+    expect(ids(false)).toEqual(["inherited:on"]);
   });
 
-  it("narrows to library skills that no provider links to", () => {
-    expect(
-      filterSkillEntries(entries, { query: "", filter: "unlinked" }).map((e) => e.name),
-    ).toEqual(["deploy"]);
+  it("offers a reset only when the project switched something off", () => {
+    const [section] = skillSections(makeSnapshot(PRIVATE_SCOPE, entries), {
+      query: "",
+      filter: "all",
+    });
+    expect(section && canResetSection(section)).toBe(true);
+    const [clean] = skillSections(makeSnapshot(PRIVATE_SCOPE, [inherited("on")]), {
+      query: "",
+      filter: "all",
+    });
+    expect(clean && canResetSection(clean)).toBe(false);
+  });
+});
+
+describe("skillProviderReach", () => {
+  const providers = [
+    support(claude, { enabled: true }),
+    support(codex, { enabled: true }),
+    support(cursor, { enabled: true }),
+    support(opencode, { enabled: false }),
+    support(grok, { enabled: true, scanned: false }),
+  ];
+
+  it("lists only enabled agents that read skill folders", () => {
+    expect(skillAgentProviders(makeSnapshot(GLOBAL_SCOPE, [], { providers }))).toEqual([
+      claude,
+      codex,
+      cursor,
+    ]);
   });
 
-  it("groups plugin sources, conflicts, and disabled skills", () => {
-    expect(filterSkillEntries(entries, { query: "", filter: "plugin" }).map((e) => e.name)).toEqual(
-      ["pdf"],
+  it("falls back to the agents that already read the skill when the server doesn't say", () => {
+    const snapshot = makeSnapshot(GLOBAL_SCOPE, [], {
+      providers: [support(claude), support(codex), support(cursor)],
+    });
+    expect(skillAgentProviders(snapshot)).toBeNull();
+    const reach = skillProviderReach(entry({ name: "a", providers: [codex] }), snapshot);
+    expect(reach).toEqual([{ provider: codex, on: true, pending: false }]);
+  });
+
+  it("marks agents that syncing would add, but not excluded or occupied folders", () => {
+    const snapshot = makeSnapshot(GLOBAL_SCOPE, [], {
+      providers,
+      linkTargets: [
+        { id: "claude", path: "/home/me/.claude/skills", providers: [claude] },
+        { id: "agents", path: "/home/me/.agents/skills", providers: [codex, cursor] },
+      ],
+    });
+    const skill = entry({
+      name: "a",
+      providers: [claude],
+      links: [
+        { targetId: "claude", path: "/home/me/.claude/skills/a", state: "linked" },
+        {
+          targetId: "agents",
+          path: "/home/me/.agents/skills/a",
+          state: "available",
+          syncPending: true,
+        },
+      ],
+    });
+    expect(skillProviderReach(skill, snapshot)).toEqual([
+      { provider: claude, on: true, pending: false },
+      { provider: codex, on: false, pending: true },
+      { provider: cursor, on: false, pending: true },
+    ]);
+    expect(providerSyncNames(makeSnapshot(GLOBAL_SCOPE, [skill]))).toEqual(["a"]);
+
+    const occupied = entry({
+      name: "b",
+      links: [
+        {
+          targetId: "agents",
+          path: "/home/me/.agents/skills/b",
+          state: "occupied",
+          occupant: "directory",
+          syncPending: true,
+        },
+      ],
+    });
+    const excluded = entry({
+      name: "c",
+      links: [
+        {
+          targetId: "agents",
+          path: "/home/me/.agents/skills/c",
+          state: "available",
+          excluded: true,
+        },
+      ],
+    });
+    expect(providerSyncNames(makeSnapshot(GLOBAL_SCOPE, [occupied, excluded]))).toEqual([]);
+  });
+
+  it("keeps other agents on when a project switches an inherited skill off for T3", () => {
+    const snapshot = makeSnapshot(PRIVATE_SCOPE, [], { providers });
+    const reach = skillProviderReach(
+      inherited("a", { enabled: false, projectDisabled: true, providers: [claude, codex, cursor] }),
+      snapshot,
     );
-    expect(
-      filterSkillEntries(entries, { query: "", filter: "conflicts" }).map((e) => e.name),
-    ).toEqual(["pdf"]);
-    expect(
-      filterSkillEntries(entries, { query: "", filter: "disabled" }).map((e) => e.name),
-    ).toEqual(["old"]);
+    expect(reach.map((item) => [item.provider, item.on])).toEqual([
+      [claude, false],
+      [codex, false],
+      [cursor, true],
+    ]);
+    expect(skillReachLabel(reach)).toBe("Cursor");
+
+    const globallyOff = skillProviderReach(
+      inherited("b", { enabled: false, globallyEnabled: false, providers: [] }),
+      snapshot,
+    );
+    expect(skillReachLabel(globallyOff)).toBe("No agents");
+  });
+
+  it("gives private skills to the agents T3 starts and nobody else", () => {
+    const snapshot = makeSnapshot(PRIVATE_SCOPE, [], { providers });
+    const reach = skillProviderReach(privateSkill("a"), snapshot);
+    expect(reach.map((item) => [item.provider, item.on])).toEqual([
+      [claude, true],
+      [codex, true],
+      [cursor, false],
+    ]);
+  });
+});
+
+describe("skillAdoptionPlan", () => {
+  it("moves the folder itself and leaves links to it working", () => {
+    const plan = skillAdoptionPlan(
+      entry({
+        id: "u",
+        name: "notes",
+        ownership: "unmanaged",
+        path: "/home/me/.agents/skills/notes",
+        origins: [
+          {
+            providers: [codex],
+            rootPath: "/home/me/.agents/skills",
+            entryPath: "/home/me/.agents/skills/notes",
+            ownedLink: false,
+          },
+          {
+            providers: [claude],
+            rootPath: "/home/me/.claude/skills",
+            entryPath: "/home/me/.claude/skills/notes",
+            symlinkTarget: "../../.agents/skills/notes",
+            ownedLink: false,
+          },
+        ],
+      }),
+    );
+    expect(plan).toEqual({
+      moved: ["/home/me/.agents/skills/notes"],
+      kept: ["/home/me/.claude/skills/notes"],
+      sourceStays: null,
+    });
+  });
+
+  it("replaces links and leaves a folder outside provider folders alone", () => {
+    const plan = skillAdoptionPlan(
+      entry({
+        id: "u",
+        name: "notes",
+        ownership: "unmanaged",
+        path: "/home/me/dotfiles/notes",
+        origins: [
+          {
+            providers: [claude],
+            rootPath: "/home/me/.claude/skills",
+            entryPath: "/home/me/.claude/skills/notes",
+            symlinkTarget: "/home/me/dotfiles/notes",
+            ownedLink: false,
+          },
+        ],
+      }),
+    );
+    expect(plan).toEqual({
+      moved: ["/home/me/.claude/skills/notes"],
+      kept: [],
+      sourceStays: "/home/me/dotfiles/notes",
+    });
+  });
+});
+
+describe("invocationNameClashes", () => {
+  it("compares the name agents load, not the folder name", () => {
+    const source = entry({
+      id: "u",
+      name: "notes",
+      invocationName: "Notes",
+      ownership: "unmanaged",
+    });
+    const snapshot = makeSnapshot(GLOBAL_SCOPE, [
+      source,
+      entry({ name: "notes-2", invocationName: "notes" }),
+      entry({ name: "other" }),
+      inherited("notes"),
+    ]);
+    expect(invocationNameClashes(snapshot, source).map((e) => e.name)).toEqual(["notes-2"]);
   });
 });
 
@@ -97,6 +435,49 @@ describe("skillLinkAction", () => {
     expect(skillLinkAction({ ...status, state: "occupied", occupant: "directory" })).toBe(
       "replace",
     );
+  });
+});
+
+describe("skillProviderSwitches", () => {
+  const targets = [
+    { id: "agents", path: "/home/me/.agents/skills", providers: [codex, claude] },
+    { id: "codex", path: "/home/me/.codex/skills", providers: [codex] },
+    { id: "codex:abc", path: "/work/codex-home/skills", providers: [codex] },
+  ];
+
+  it("explains targets that switch several providers, or that T3 must leave alone", () => {
+    const [shared, inherited, occupied] = skillProviderSwitches(
+      [
+        { targetId: "agents", path: "/home/me/.agents/skills/x", state: "available" },
+        { targetId: "codex", path: "/home/me/.codex/skills/x", state: "linked", inherited: true },
+        {
+          targetId: "codex:abc",
+          path: "/work/codex-home/skills/x",
+          state: "occupied",
+          occupant: "directory",
+        },
+      ],
+      targets,
+    );
+    expect(shared).toMatchObject({ label: "Codex, Claude", on: false, action: "link" });
+    expect(shared?.note).toContain("switch together");
+    expect(inherited).toMatchObject({ on: true, action: null });
+    expect(occupied).toMatchObject({ on: false, action: "replace" });
+    expect(occupied?.note).toContain("its own folder");
+  });
+
+  it("names the path when two targets read the same providers", () => {
+    const rows = skillProviderSwitches(
+      [
+        { targetId: "codex", path: "/home/me/.codex/skills/x", state: "linked" },
+        { targetId: "codex:abc", path: "/work/codex-home/skills/x", state: "available" },
+      ],
+      targets,
+    );
+    expect(rows.map((row) => row.note)).toEqual([
+      "/home/me/.codex/skills/x",
+      "/work/codex-home/skills/x",
+    ]);
   });
 });
 

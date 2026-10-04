@@ -2703,6 +2703,22 @@ const makeWsRpcLayer = (
               "rpc.aggregate": "skills",
             },
           ),
+        [WS_METHODS.skillsSetEnabledMany]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsSetEnabledMany, skillLibrary.setEnabledMany(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsResetProject]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsResetProject, skillLibrary.resetProject(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsSyncProviders]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsSyncProviders, skillLibrary.syncProviders(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsRelease]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsRelease, skillLibrary.release(input), {
+            "rpc.aggregate": "skills",
+          }),
         [WS_METHODS.serverRetryResourceTelemetry]: (_input) =>
           observeRpcEffect(WS_METHODS.serverRetryResourceTelemetry, resourceTelemetry.retry, {
             "rpc.aggregate": "server",

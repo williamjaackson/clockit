@@ -317,13 +317,20 @@ import {
   SkillsReadInstructionsInput,
   SkillsReadResult,
   SkillsRecoveryInput,
+  SkillsReleaseInput,
+  SkillsReleaseResult,
+  SkillsResetProjectInput,
+  SkillsResetProjectResult,
   SkillsRestoreResult,
   SkillsSaveInput,
   SkillsSaveInstructionsInput,
   SkillsSaveResult,
   SkillsSetEnabledInput,
+  SkillsSetEnabledManyInput,
   SkillsSetEnabledResult,
   SkillsSnapshot,
+  SkillsSyncProvidersInput,
+  SkillsSyncProvidersResult,
   SkillsUnlinkInput,
   SkillsUnlinkResult,
   SkillsUpdateProjectSettingsInput,
@@ -508,6 +515,10 @@ export const WS_METHODS = {
   skillsSaveInstructions: "skills.saveInstructions",
   skillsImportInstructions: "skills.importInstructions",
   skillsUpdateProjectSettings: "skills.updateProjectSettings",
+  skillsSetEnabledMany: "skills.setEnabledMany",
+  skillsResetProject: "skills.resetProject",
+  skillsSyncProviders: "skills.syncProviders",
+  skillsRelease: "skills.release",
 
   // Scheduled tasks
   scheduledTasksList: "scheduledTasks.list",
@@ -971,6 +982,30 @@ const WsSkillsImportInstructionsRpc = Rpc.make(WS_METHODS.skillsImportInstructio
 const WsSkillsUpdateProjectSettingsRpc = Rpc.make(WS_METHODS.skillsUpdateProjectSettings, {
   payload: SkillsUpdateProjectSettingsInput,
   success: SkillsSnapshot,
+  error: SkillsRpcError,
+});
+
+const WsSkillsSetEnabledManyRpc = Rpc.make(WS_METHODS.skillsSetEnabledMany, {
+  payload: SkillsSetEnabledManyInput,
+  success: SkillsSetEnabledResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsResetProjectRpc = Rpc.make(WS_METHODS.skillsResetProject, {
+  payload: SkillsResetProjectInput,
+  success: SkillsResetProjectResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsSyncProvidersRpc = Rpc.make(WS_METHODS.skillsSyncProviders, {
+  payload: SkillsSyncProvidersInput,
+  success: SkillsSyncProvidersResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsReleaseRpc = Rpc.make(WS_METHODS.skillsRelease, {
+  payload: SkillsReleaseInput,
+  success: SkillsReleaseResult,
   error: SkillsRpcError,
 });
 
@@ -1888,6 +1923,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsSkillsSaveInstructionsRpc,
   WsSkillsImportInstructionsRpc,
   WsSkillsUpdateProjectSettingsRpc,
+  WsSkillsSetEnabledManyRpc,
+  WsSkillsResetProjectRpc,
+  WsSkillsSyncProvidersRpc,
+  WsSkillsReleaseRpc,
   WsServerSignalProcessRpc,
   WsScheduledTasksListRpc,
   WsScheduledTasksSubscribeRpc,

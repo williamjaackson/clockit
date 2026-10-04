@@ -110,6 +110,10 @@ const recordingLibrary = (answer?: unknown) => {
     saveInstructions: record("saveInstructions"),
     importInstructions: record("importInstructions"),
     updateProjectSettings: record("updateProjectSettings"),
+    setEnabledMany: record("setEnabledMany"),
+    resetProject: record("resetProject"),
+    syncProviders: record("syncProviders"),
+    release: record("release"),
     resolveProjectOverlay: record("resolveProjectOverlay"),
     streamChanges: Stream.empty,
   } satisfies SkillLibrary.SkillLibrary["Service"];
@@ -147,9 +151,11 @@ it.effect("denies mutations to callers that cannot write, before the library is 
       const deleted = yield* last(
         toolkit.handle("t3_skills_delete_recovery", { scope: {}, recoveryId: "recovery-1" }),
       );
+      const released = yield* last(toolkit.handle("t3_skills_release", { name: "mine" }));
       expect(saved.isFailure).toBe(true);
       expect(saved.result).toMatchObject({ _tag: "OrchestratorMcpFailure", code: context.code });
       expect(deleted.result).toMatchObject({ _tag: "OrchestratorMcpFailure", code: context.code });
+      expect(released.result).toMatchObject({ _tag: "OrchestratorMcpFailure", code: context.code });
       expect(calls).toEqual([]);
     }
   }),

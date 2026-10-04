@@ -1,32 +1,42 @@
 import type { MenuAction } from "@react-native-menu/menu";
 import type {
   EnvironmentId,
+  ResolvedSkillScope,
   SkillEntry,
   SkillLinkStatus,
   SkillLinkSubject,
-  SkillOwnership,
-  SkillPathKind,
+  SkillLinkTarget,
   SkillScope,
+  SkillsSnapshot,
 } from "@t3tools/contracts";
 import {
-  INHERITED_LINK_NOTE,
-  isUnlinkedLibrarySkill,
-  providerDisplayName,
-  skillLinkAction,
+  canResetSection,
+  skillBulkEntries,
+  skillOccupantNoun,
+  skillProviderReach,
+  skillProviderSwitches,
+  skillReachLabel,
+  skillRowStatus,
+  skillToggle,
+  type SkillProviderReach,
+  type SkillProviderSwitch,
+  type SkillSection,
 } from "@t3tools/client-runtime/state/skills";
 import { useEffect, useState, type ReactNode } from "react";
-import { ActivityIndicator, Platform, Pressable, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Platform, Pressable, TextInput, View } from "react-native";
 
 import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
 import { ControlPillMenu } from "../../components/ControlPill";
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { MaterialListRow } from "../../components/MaterialListRow";
+import { ProviderIcon } from "../../components/ProviderIcon";
+import { ThemedSwitch } from "../../components/ThemedSwitch";
 import { cn } from "../../lib/cn";
 import { skillsEnvironment } from "../../state/skills";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { SettingsActionRow } from "../settings/components/SettingsActionRow";
-import { confirmSkillsAction, runSkillsCommand } from "./skills-commands";
+import { runSkillsCommand } from "./skills-commands";
 
 /** A labeled row that opens a native menu of choices. */
 export function SkillsSelectRow(props: {
@@ -71,23 +81,147 @@ export function SkillsSelectRow(props: {
   );
 }
 
-const OWNERSHIP_LABEL: Record<SkillOwnership, string> = {
-  managed: "Library",
-  unmanaged: "Not in library",
-  plugin: "Plugin",
-  system: "Built-in",
-};
+/** One icon per agent T3 can give skills to, dimmed for agents without the skill. */
+export function SkillAgentIcons(props: { readonly reach: ReadonlyArray<SkillProviderReach> }) {
+  if (props.reach.length === 0) return null;
+  return (
+    <View
+      className="flex-row items-center gap-1.5"
+      accessibilityElementsHidden
+      importantForAccessibility="no-hide-descendants"
+    >
+      {props.reach.map((item) => (
+        <View key={item.provider} style={{ opacity: item.on ? 1 : 0.3 }}>
+          <ProviderIcon provider={item.provider} size={14} />
+        </View>
+      ))}
+    </View>
+  );
+}
 
-export function skillEntrySummary(entry: SkillEntry): string {
-  return [
-    OWNERSHIP_LABEL[entry.ownership],
-    entry.enabled ? null : "Disabled",
-    isUnlinkedLibrarySkill(entry) ? "Not linked" : null,
-    entry.conflicts.length > 0 ? "Same name" : null,
-    entry.providers.map(providerDisplayName).join(", ") || null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+/**
+ * One skill in a list: the name, its purpose, and which agents have it. The
+ * switch sits beside the pressable area, never inside it.
+ */
+export function SkillListRow(props: {
+  readonly entry: SkillEntry;
+  readonly snapshot: SkillsSnapshot;
+  /** The value a switch request in flight asks for, if any. */
+  readonly pendingEnabled: boolean | undefined;
+  readonly borderTop?: boolean;
+  readonly onPress: () => void;
+  readonly onToggle: (enabled: boolean) => void;
+}) {
+  const { entry, snapshot } = props;
+  const toggle = skillToggle(entry, snapshot.scope);
+  const checked = props.pendingEnabled ?? toggle?.checked ?? false;
+  const reach = skillProviderReach(entry, snapshot);
+  const status = skillRowStatus(entry, snapshot.scope);
+  const muted = toggle !== null && !checked;
+  return (
+    <View
+      className={cn(
+        "min-h-14 flex-row items-center gap-3 pr-4",
+        props.borderTop && "border-t border-border-subtle",
+      )}
+    >
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={[
+          entry.name,
+          entry.description,
+          `Agents: ${skillReachLabel(reach)}`,
+          status,
+        ]
+          .filter(Boolean)
+          .join(". ")}
+        onPress={props.onPress}
+        className="min-w-0 flex-1 gap-0.5 py-3 pl-4 active:opacity-70"
+      >
+        <Text className={cn("text-lg", muted ? "text-foreground-muted" : "text-foreground")}>
+          {entry.name}
+        </Text>
+        {entry.description ? (
+          <Text className="text-sm text-foreground-muted" numberOfLines={1}>
+            {entry.description}
+          </Text>
+        ) : null}
+        {reach.length > 0 || status !== null ? (
+          <View className="flex-row items-center gap-2 pt-0.5">
+            <SkillAgentIcons reach={reach} />
+            {status !== null ? (
+              <Text className="min-w-0 shrink text-xs text-foreground-muted" numberOfLines={1}>
+                {status}
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
+      </Pressable>
+      {toggle !== null ? (
+        <ThemedSwitch
+          accessibilityLabel={`Use ${entry.name}`}
+          accessibilityHint={toggle.disabledReason ?? undefined}
+          disabled={props.pendingEnabled !== undefined || toggle.disabledReason !== null}
+          value={checked}
+          onValueChange={props.onToggle}
+        />
+      ) : (
+        <SymbolView name="chevron.right" size={14} tintColorClassName="accent-chevron" />
+      )}
+    </View>
+  );
+}
+
+/** Bulk switches for one project section, from a native menu in its header. */
+export function SkillSectionMenu(props: {
+  readonly section: SkillSection;
+  readonly scope: ResolvedSkillScope;
+  readonly disabled: boolean;
+  readonly onBulk: (enabled: boolean) => void;
+  readonly onReset: () => void;
+}) {
+  const { section, scope } = props;
+  const resettable = section.id === "inherited" || section.id === "repository";
+  const actions: MenuAction[] = [
+    {
+      id: "on",
+      title: "Turn all on",
+      attributes: { disabled: skillBulkEntries(section.all, scope, true).length === 0 },
+    },
+    {
+      id: "off",
+      title: "Turn all off",
+      attributes: { disabled: skillBulkEntries(section.all, scope, false).length === 0 },
+    },
+    ...(resettable
+      ? [
+          {
+            id: "reset",
+            title: "Reset to default",
+            attributes: { disabled: !canResetSection(section) },
+          },
+        ]
+      : []),
+  ];
+  return (
+    <ControlPillMenu
+      actions={actions}
+      onPressAction={({ nativeEvent }) => {
+        if (nativeEvent.event === "on") props.onBulk(true);
+        else if (nativeEvent.event === "off") props.onBulk(false);
+        else if (nativeEvent.event === "reset") props.onReset();
+      }}
+    >
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Actions for ${section.title}`}
+        disabled={props.disabled}
+        className="px-2 py-1 active:opacity-70 disabled:opacity-40"
+      >
+        <SymbolView name="ellipsis.circle" size={18} tintColorClassName="accent-icon" />
+      </Pressable>
+    </ControlPillMenu>
+  );
 }
 
 /** A tappable two-line row: title, then muted detail. */
@@ -167,99 +301,101 @@ export function SkillsWarning(props: { readonly title: string; readonly detail: 
   );
 }
 
-const OCCUPANT_LABEL: Record<SkillPathKind, string> = {
-  directory: "folder",
-  file: "file",
-  symlink: "link",
-};
-
 /**
- * Link state per target for one subject: a global library skill or the global
- * instructions, or in shared mode a repository skill or `AGENTS.md`.
+ * "Use with" switches for one subject: a global library skill or the global
+ * instructions in provider folders, or in shared mode a repository skill or
+ * `AGENTS.md`. Each switch adds or removes T3's link at one target.
  */
-export function SkillLinkRows(props: {
+export function SkillProviderSwitchRows(props: {
   readonly environmentId: EnvironmentId;
   readonly scope: SkillScope;
   readonly subject: SkillLinkSubject;
   readonly subjectLabel: string;
   readonly links: ReadonlyArray<SkillLinkStatus>;
-  readonly providersFor: (targetId: string) => string;
+  readonly linkTargets: ReadonlyArray<SkillLinkTarget>;
+  /** Called for a provider that already has its own file, before offering to replace it. */
+  readonly onImportText?: (row: SkillProviderSwitch) => void;
 }) {
   const link = useAtomCommand(skillsEnvironment.link, { reportFailure: false });
   const unlink = useAtomCommand(skillsEnvironment.unlink, { reportFailure: false });
   const [pendingId, setPendingId] = useState<string | null>(null);
 
-  const run = async (status: SkillLinkStatus) => {
+  const run = async (row: SkillProviderSwitch, on: boolean) => {
     if (pendingId !== null) return;
-    if (status.state === "occupied") {
-      const occupant = status.occupant === undefined ? "item" : OCCUPANT_LABEL[status.occupant];
-      const confirmed = await confirmSkillsAction({
-        title: `Replace the ${occupant}?`,
-        message: `${status.path} moves to Recovery, where you can restore it, and ${props.subjectLabel} is linked in its place.`,
-        confirmLabel: "Replace",
-        destructive: true,
+    const { status } = row;
+    if (row.action === "replace") {
+      const choice = await new Promise<"replace" | "import" | null>((resolve) => {
+        Alert.alert(
+          `Use ${props.subjectLabel} with ${row.label}?`,
+          `${status.path} already has its own ${skillOccupantNoun(status)}. Replacing moves it to Recovery, where you can restore it.`,
+          [
+            ...(props.onImportText
+              ? [{ text: "Import its text", onPress: () => resolve("import") }]
+              : []),
+            { text: "Replace", style: "destructive", onPress: () => resolve("replace") },
+            { text: "Cancel", style: "cancel", onPress: () => resolve(null) },
+          ],
+          { cancelable: true, onDismiss: () => resolve(null) },
+        );
       });
-      if (!confirmed) return;
+      if (choice === "import") props.onImportText?.(row);
+      if (choice !== "replace") return;
     }
     setPendingId(status.targetId);
     const targetIds: [string] = [status.targetId];
-    await (status.state === "linked"
+    await (on || row.action === "replace"
       ? runSkillsCommand(
-          unlink({
-            environmentId: props.environmentId,
-            input: { scope: props.scope, subject: props.subject, targetIds },
-          }),
-          "Could not unlink",
-        )
-      : runSkillsCommand(
           link({
             environmentId: props.environmentId,
             input: {
               scope: props.scope,
               subject: props.subject,
               targetIds,
-              replace: status.state === "occupied",
+              replace: row.action === "replace",
             },
           }),
-          "Could not link",
+          "Could not turn it on",
+        )
+      : runSkillsCommand(
+          unlink({
+            environmentId: props.environmentId,
+            input: { scope: props.scope, subject: props.subject, targetIds },
+          }),
+          "Could not turn it off",
         ));
     setPendingId(null);
   };
 
-  return props.links.map((status, index) => {
-    const action = skillLinkAction(status);
-    return (
-      <SkillsDetailRow
-        key={status.targetId}
-        title={props.providersFor(status.targetId)}
-        detail={status.path}
-        borderTop={index > 0}
-        accessory={
-          action === null ? (
-            <Text accessibilityHint={INHERITED_LINK_NOTE} className="text-sm text-foreground-muted">
-              Linked via parent
-            </Text>
-          ) : pendingId === status.targetId ? (
-            <ActivityIndicator colorClassName="accent-icon" />
-          ) : (
-            <Pressable
-              accessibilityRole="button"
-              disabled={pendingId !== null}
-              onPress={() => void run(status)}
-              className="rounded-full bg-subtle px-3 py-2 active:opacity-70"
-            >
-              <Text className="text-sm font-t3-medium text-foreground">
-                {LINK_ACTION_LABEL[action]}
-              </Text>
-            </Pressable>
-          )
-        }
-      />
-    );
-  });
+  return skillProviderSwitches(props.links, props.linkTargets).map((row, index) => (
+    <SkillsDetailRow
+      key={row.status.targetId}
+      title={row.label}
+      detail={row.note ?? undefined}
+      borderTop={index > 0}
+      accessory={
+        pendingId === row.status.targetId ? (
+          <ActivityIndicator colorClassName="accent-icon" />
+        ) : row.action === "replace" ? (
+          <Pressable
+            accessibilityRole="button"
+            disabled={pendingId !== null}
+            onPress={() => void run(row, true)}
+            className="rounded-full bg-subtle px-3 py-2 active:opacity-70"
+          >
+            <Text className="text-sm font-t3-medium text-foreground">Replace…</Text>
+          </Pressable>
+        ) : (
+          <ThemedSwitch
+            accessibilityLabel={`Use with ${row.label}`}
+            disabled={pendingId !== null || row.action === null}
+            value={row.on}
+            onValueChange={(on) => void run(row, on)}
+          />
+        )
+      }
+    />
+  ));
 }
-
-const LINK_ACTION_LABEL = { link: "Link", unlink: "Unlink", replace: "Replace" } as const;
 
 export type SkillFileSaveOutcome =
   | { readonly _tag: "saved"; readonly revision: string | null }

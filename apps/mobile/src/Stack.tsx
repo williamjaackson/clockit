@@ -76,6 +76,7 @@ import {
 } from "./features/skills/SkillDetailRouteScreen";
 import {
   SkillImportRouteScreen,
+  SkillReleaseRouteScreen,
   SkillNewRouteScreen,
 } from "./features/skills/SkillFormRouteScreens";
 import { SkillInstructionsRouteScreen } from "./features/skills/SkillInstructionsRouteScreen";
@@ -430,6 +431,10 @@ const SettingsContentStack = createNativeStackNavigator({
     SettingsSkillImport: createNativeStackScreen({
       screen: SkillImportRouteScreen,
       options: { title: "Import" },
+    }),
+    SettingsSkillRelease: createNativeStackScreen({
+      screen: SkillReleaseRouteScreen,
+      options: { title: "Stop managing" },
     }),
   },
 });

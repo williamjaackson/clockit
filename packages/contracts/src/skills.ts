@@ -107,6 +107,17 @@ export const SkillLinkStatus = Schema.Struct({
    * library. Linking is a no-op and unlinking leaves it alone.
    */
   inherited: Schema.optional(Schema.Boolean),
+  /**
+   * Global library skills only: the user unlinked this target, so syncing
+   * providers skips it until it is linked again.
+   */
+  excluded: Schema.optional(Schema.Boolean),
+  /**
+   * Global library skills only: syncing providers would link here, because an
+   * enabled provider does not reach the skill yet. With `state: "occupied"`
+   * the sync skips it and reports the path.
+   */
+  syncPending: Schema.optional(Schema.Boolean),
 });
 export type SkillLinkStatus = typeof SkillLinkStatus.Type;
 
@@ -117,7 +128,9 @@ export type SkillEntryScope = typeof SkillEntryScope.Type;
 export const SkillEntry = Schema.Struct({
   /**
    * Library skills use `managed:<name>`, which survives enabling and
-   * disabling. Other entries hash their physical path.
+   * disabling. Local project snapshots list the global library too, as
+   * read-only `inherited:<name>` entries with `scope: "global"`. Other
+   * entries hash their physical path.
    */
   id: Schema.String,
   /** The folder name. Library requests address skills by it. */
@@ -143,6 +156,19 @@ export const SkillEntry = Schema.Struct({
   links: ForwardCompatibleArray(SkillLinkStatus),
   editable: Schema.Boolean,
   pluginId: Schema.optional(Schema.String),
+  /**
+   * `inherited:<name>` entries only: whether the global library has the skill
+   * on. A skill off globally is off in every project and cannot be switched on
+   * for one project alone.
+   */
+  globallyEnabled: Schema.optional(Schema.Boolean),
+  /**
+   * Local project snapshots only, on inherited and repository entries: the
+   * user switched the skill off for this project. `enabled` can also be false
+   * because a private skill replaces it (a `replacedByLocal` conflict) or,
+   * for inherited entries, because it is off globally.
+   */
+  projectDisabled: Schema.optional(Schema.Boolean),
 });
 export type SkillEntry = typeof SkillEntry.Type;
 
@@ -155,6 +181,11 @@ export const SkillLinkTarget = Schema.Struct({
   id: Schema.String,
   path: Schema.String,
   providers: Schema.Array(ProviderDriverKind),
+  /**
+   * New global skills link here, and so does syncing providers: together the
+   * default targets reach every provider enabled in T3's settings.
+   */
+  default: Schema.optional(Schema.Boolean),
 });
 export type SkillLinkTarget = typeof SkillLinkTarget.Type;
 
@@ -163,6 +194,11 @@ export const SkillProviderSupport = Schema.Struct({
   provider: ProviderDriverKind,
   /** False when T3 can only show what the provider reports itself. */
   scanned: Schema.Boolean,
+  /**
+   * Set up and switched on in T3's settings, by any of its instances. Sign-in
+   * or CLI health does not change it. Default links only serve enabled providers.
+   */
+  enabled: Schema.optional(Schema.Boolean),
   globalRoots: Schema.Array(Schema.String),
   /** Folders relative to a project root. */
   projectRoots: Schema.Array(Schema.String),
@@ -299,6 +335,11 @@ export type SkillsSaveInput = typeof SkillsSaveInput.Type;
 export const SkillsSaveResult = Schema.Struct({
   path: Schema.String,
   revision: Schema.String,
+  /**
+   * Creating a global skill links it into the default targets. These are the
+   * link paths something else already occupies, left untouched.
+   */
+  skippedLinks: Schema.optional(Schema.Array(Schema.String)),
   snapshot: SkillsSnapshot,
 });
 export type SkillsSaveResult = typeof SkillsSaveResult.Type;
@@ -321,6 +362,8 @@ export const SkillsImportResult = Schema.Struct({
   name: SkillName,
   path: Schema.String,
   recovery: Schema.Array(SkillRecoveryEntry),
+  /** Global imports only: default link paths something else occupies, left untouched. */
+  skippedLinks: Schema.optional(Schema.Array(Schema.String)),
   snapshot: SkillsSnapshot,
 });
 export type SkillsImportResult = typeof SkillsImportResult.Type;
@@ -331,6 +374,19 @@ export const SkillsSetEnabledInput = Schema.Struct({
   enabled: Schema.Boolean,
 });
 export type SkillsSetEnabledInput = typeof SkillsSetEnabledInput.Type;
+
+/**
+ * Switch several skills of one scope on or off together. Every ref is checked
+ * before anything changes, and either all of them apply or none do. In a local
+ * project scope, `inherited:<name>` entries change only that project, and one
+ * that is off globally cannot be switched on.
+ */
+export const SkillsSetEnabledManyInput = Schema.Struct({
+  scope: SkillScope,
+  skills: Schema.NonEmptyArray(SkillRef),
+  enabled: Schema.Boolean,
+});
+export type SkillsSetEnabledManyInput = typeof SkillsSetEnabledManyInput.Type;
 
 export const SkillsSetEnabledResult = Schema.Struct({
   /** Links T3 could not restore because something else now occupies the path. */
@@ -462,6 +518,78 @@ export const SkillsUpdateProjectSettingsInput = Schema.Struct({
   globalInstructionsEnabled: Schema.optional(Schema.Boolean),
 });
 export type SkillsUpdateProjectSettingsInput = typeof SkillsUpdateProjectSettingsInput.Type;
+
+/**
+ * Which per-project switches a reset clears: `inherited` global library
+ * skills, or `repository` skills. Private skills are never touched by a reset.
+ */
+export const SkillProjectSelectionSection = Schema.Literals(["inherited", "repository"]);
+export type SkillProjectSelectionSection = typeof SkillProjectSelectionSection.Type;
+
+export const SkillsResetProjectInput = Schema.Struct({
+  projectPath: TrimmedNonEmptyString,
+  sections: Schema.NonEmptyArray(SkillProjectSelectionSection),
+});
+export type SkillsResetProjectInput = typeof SkillsResetProjectInput.Type;
+
+export const SkillsResetProjectResult = Schema.Struct({
+  /** Global skill names switched back on, including names no longer in the library. */
+  inherited: Schema.Array(Schema.String),
+  /** Repository skill paths switched back on, relative to the profile's project root. */
+  repository: Schema.Array(Schema.String),
+  snapshot: SkillsSnapshot,
+});
+export type SkillsResetProjectResult = typeof SkillsResetProjectResult.Type;
+
+/**
+ * Link enabled global library skills into the default targets they do not
+ * reach yet. Nothing is removed or replaced, and targets the user unlinked
+ * stay unlinked.
+ */
+export const SkillsSyncProvidersInput = Schema.Struct({
+  /** Defaults to every enabled global library skill. */
+  names: Schema.optional(Schema.NonEmptyArray(SkillName)),
+});
+export type SkillsSyncProvidersInput = typeof SkillsSyncProvidersInput.Type;
+
+export const SkillsSyncProvidersResult = Schema.Struct({
+  linked: Schema.Array(Schema.String),
+  /** Link paths something else occupies. */
+  skippedLinks: Schema.Array(Schema.String),
+  snapshot: SkillsSnapshot,
+});
+export type SkillsSyncProvidersResult = typeof SkillsSyncProvidersResult.Type;
+
+/**
+ * Stop managing a global library skill. Its current folder moves out of the
+ * library to `destination`, and every link of T3's that reached it points
+ * there instead, so the same providers keep it. Recovery items stay as they
+ * were and cannot overwrite the released folder.
+ *
+ * An enabled skill defaults to the first provider folder holding T3's link,
+ * else `~/.agents/skills/<name>` when that path is free. A disabled skill
+ * needs a `destination` outside every provider skill folder, so releasing it
+ * never gives an agent access. Run with `dryRun` first to show the plan.
+ */
+export const SkillsReleaseInput = Schema.Struct({
+  name: SkillName,
+  /** Absolute path of the folder to create. */
+  destination: Schema.optional(TrimmedNonEmptyString),
+  dryRun: Schema.optional(Schema.Boolean),
+});
+export type SkillsReleaseInput = typeof SkillsReleaseInput.Type;
+
+export const SkillsReleaseResult = Schema.Struct({
+  name: SkillName,
+  destination: Schema.String,
+  wasEnabled: Schema.Boolean,
+  /** Provider paths whose link to the library copy now points at `destination`. */
+  relinked: Schema.Array(Schema.String),
+  /** False for a dry run, which changes nothing. */
+  released: Schema.Boolean,
+  snapshot: SkillsSnapshot,
+});
+export type SkillsReleaseResult = typeof SkillsReleaseResult.Type;
 
 export const SkillsErrorReason = Schema.Literals([
   "invalidScope",
