@@ -249,6 +249,17 @@ export function CommandPalette(props: {
           }),
       },
       {
+        key: "skills",
+        kind: "action",
+        title: "Skills",
+        searchTerms: ["agents.md", "claude.md", "instructions", "library"],
+        run: () =>
+          navigation.navigate("SettingsSheet", {
+            screen: "SettingsContent",
+            params: { screen: "SettingsSkills" },
+          }),
+      },
+      {
         key: "archive",
         kind: "action",
         title: "Archived threads",

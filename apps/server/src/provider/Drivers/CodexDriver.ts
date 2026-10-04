@@ -50,6 +50,10 @@ import {
 } from "../Layers/CodexProvider.ts";
 import { resolveCodexLaunchArgs } from "../Layers/codexLaunchArgs.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
+import {
+  applySkillOverlayToCatalog,
+  skillOverlayResolverFromContext,
+} from "../ProviderSkillOverlay.ts";
 import * as ModelManifest from "../ModelManifest.ts";
 import type { ProviderDriver, ProviderInstance } from "../ProviderDriver.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
@@ -191,6 +195,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         ),
       );
 
+      const resolveSkillOverlay = yield* skillOverlayResolverFromContext;
       const orchestrationAdapter = yield* createCodexAdapterV2(
         {
           instanceId,
@@ -200,7 +205,10 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
           enabled,
           config,
         },
-        { onUsageLimits: (update) => snapshot.applyUsageLimits(update) },
+        {
+          onUsageLimits: (update) => snapshot.applyUsageLimits(update),
+          ...(resolveSkillOverlay === undefined ? {} : { resolveSkillOverlay }),
+        },
       ).pipe(
         Effect.mapError(
           (cause) =>
@@ -288,8 +296,12 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
                 Effect.timeout("20 seconds"),
                 Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
               ),
+              resolveSkillOverlay === undefined ? Effect.undefined : resolveSkillOverlay(cwd),
             ]).pipe(
-              Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })),
+              Effect.map(([machineSnapshot, skills, skillOverlay]) => ({
+                ...machineSnapshot,
+                skills: applySkillOverlayToCatalog(skills, skillOverlay, "codex"),
+              })),
               Effect.mapError(
                 (cause) =>
                   new ProviderDriverError({

@@ -46,6 +46,7 @@ import * as Option from "effect/Option";
 import {
   ArrowLeftIcon,
   ChartNoAxesColumnIcon,
+  LibraryBigIcon,
   CheckIcon,
   ChevronRightIcon,
   CornerLeftUpIcon,
@@ -563,6 +564,13 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         event.stopPropagation();
         setOpen(false);
         void navigate({ to: "/usage" });
+        return;
+      }
+      if (command === "skills.open") {
+        event.preventDefault();
+        event.stopPropagation();
+        setOpen(false);
+        void navigate({ to: "/skills" });
         return;
       }
       const mode = overlayModeForCommand(command);
@@ -2240,6 +2248,18 @@ function OpenCommandPaletteDialog(props: {
     shortcutCommand: "usage.open",
     run: async () => {
       await navigate({ to: "/usage" });
+    },
+  });
+
+  actionItems.push({
+    kind: "action",
+    value: "action:skills",
+    searchTerms: ["skills", "agents.md", "claude.md", "instructions", "prompts", "library"],
+    title: "Open skills",
+    icon: <LibraryBigIcon className={ITEM_ICON_CLASS} />,
+    shortcutCommand: "skills.open",
+    run: async () => {
+      await navigate({ to: "/skills" });
     },
   });
 

@@ -302,6 +302,32 @@ import {
   ProviderConsumeResetCreditResult,
 } from "./providerUsageLimits.ts";
 import { UsagePricing, UsageReadError, UsageSummary, UsageSummaryInput } from "./usage.ts";
+import {
+  SkillInstructionsDocument,
+  SkillsArchiveInput,
+  SkillsArchiveResult,
+  SkillsError,
+  SkillsImportInput,
+  SkillsImportInstructionsInput,
+  SkillsImportResult,
+  SkillsLinkInput,
+  SkillsLinkResult,
+  SkillsListInput,
+  SkillsReadInput,
+  SkillsReadInstructionsInput,
+  SkillsReadResult,
+  SkillsRecoveryInput,
+  SkillsRestoreResult,
+  SkillsSaveInput,
+  SkillsSaveInstructionsInput,
+  SkillsSaveResult,
+  SkillsSetEnabledInput,
+  SkillsSetEnabledResult,
+  SkillsSnapshot,
+  SkillsUnlinkInput,
+  SkillsUnlinkResult,
+  SkillsUpdateProjectSettingsInput,
+} from "./skills.ts";
 import { ServerSettings, ServerSettingsError, ServerSettingsPatch } from "./settings.ts";
 import {
   ScheduledTaskDeleteInput,
@@ -466,6 +492,22 @@ export const WS_METHODS = {
   serverGetBackgroundPolicy: "server.getBackgroundPolicy",
   serverGetUsageSummary: "server.getUsageSummary",
   serverRefreshUsageRates: "server.refreshUsageRates",
+
+  // Skills management
+  skillsList: "skills.list",
+  skillsRead: "skills.read",
+  skillsSave: "skills.save",
+  skillsImport: "skills.import",
+  skillsSetEnabled: "skills.setEnabled",
+  skillsArchive: "skills.archive",
+  skillsRestore: "skills.restore",
+  skillsDeleteRecovery: "skills.deleteRecovery",
+  skillsLink: "skills.link",
+  skillsUnlink: "skills.unlink",
+  skillsReadInstructions: "skills.readInstructions",
+  skillsSaveInstructions: "skills.saveInstructions",
+  skillsImportInstructions: "skills.importInstructions",
+  skillsUpdateProjectSettings: "skills.updateProjectSettings",
 
   // Scheduled tasks
   scheduledTasksList: "scheduledTasks.list",
@@ -844,6 +886,92 @@ const WsServerRefreshUsageRatesRpc = Rpc.make(WS_METHODS.serverRefreshUsageRates
   payload: Schema.Struct({}),
   success: UsagePricing,
   error: EnvironmentAuthorizationError,
+});
+
+const SkillsRpcError = Schema.Union([SkillsError, EnvironmentAuthorizationError]);
+
+const WsSkillsListRpc = Rpc.make(WS_METHODS.skillsList, {
+  payload: SkillsListInput,
+  success: SkillsSnapshot,
+  error: SkillsRpcError,
+});
+
+const WsSkillsReadRpc = Rpc.make(WS_METHODS.skillsRead, {
+  payload: SkillsReadInput,
+  success: SkillsReadResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsSaveRpc = Rpc.make(WS_METHODS.skillsSave, {
+  payload: SkillsSaveInput,
+  success: SkillsSaveResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsImportRpc = Rpc.make(WS_METHODS.skillsImport, {
+  payload: SkillsImportInput,
+  success: SkillsImportResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsSetEnabledRpc = Rpc.make(WS_METHODS.skillsSetEnabled, {
+  payload: SkillsSetEnabledInput,
+  success: SkillsSetEnabledResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsArchiveRpc = Rpc.make(WS_METHODS.skillsArchive, {
+  payload: SkillsArchiveInput,
+  success: SkillsArchiveResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsRestoreRpc = Rpc.make(WS_METHODS.skillsRestore, {
+  payload: SkillsRecoveryInput,
+  success: SkillsRestoreResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsDeleteRecoveryRpc = Rpc.make(WS_METHODS.skillsDeleteRecovery, {
+  payload: SkillsRecoveryInput,
+  success: SkillsSnapshot,
+  error: SkillsRpcError,
+});
+
+const WsSkillsLinkRpc = Rpc.make(WS_METHODS.skillsLink, {
+  payload: SkillsLinkInput,
+  success: SkillsLinkResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsUnlinkRpc = Rpc.make(WS_METHODS.skillsUnlink, {
+  payload: SkillsUnlinkInput,
+  success: SkillsUnlinkResult,
+  error: SkillsRpcError,
+});
+
+const WsSkillsReadInstructionsRpc = Rpc.make(WS_METHODS.skillsReadInstructions, {
+  payload: SkillsReadInstructionsInput,
+  success: SkillInstructionsDocument,
+  error: SkillsRpcError,
+});
+
+const WsSkillsSaveInstructionsRpc = Rpc.make(WS_METHODS.skillsSaveInstructions, {
+  payload: SkillsSaveInstructionsInput,
+  success: SkillInstructionsDocument,
+  error: SkillsRpcError,
+});
+
+const WsSkillsImportInstructionsRpc = Rpc.make(WS_METHODS.skillsImportInstructions, {
+  payload: SkillsImportInstructionsInput,
+  success: SkillInstructionsDocument,
+  error: SkillsRpcError,
+});
+
+const WsSkillsUpdateProjectSettingsRpc = Rpc.make(WS_METHODS.skillsUpdateProjectSettings, {
+  payload: SkillsUpdateProjectSettingsInput,
+  success: SkillsSnapshot,
+  error: SkillsRpcError,
 });
 
 const WsServerSignalProcessRpc = Rpc.make(WS_METHODS.serverSignalProcess, {
@@ -1746,6 +1874,20 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerRetryResourceTelemetryRpc,
   WsServerGetUsageSummaryRpc,
   WsServerRefreshUsageRatesRpc,
+  WsSkillsListRpc,
+  WsSkillsReadRpc,
+  WsSkillsSaveRpc,
+  WsSkillsImportRpc,
+  WsSkillsSetEnabledRpc,
+  WsSkillsArchiveRpc,
+  WsSkillsRestoreRpc,
+  WsSkillsDeleteRecoveryRpc,
+  WsSkillsLinkRpc,
+  WsSkillsUnlinkRpc,
+  WsSkillsReadInstructionsRpc,
+  WsSkillsSaveInstructionsRpc,
+  WsSkillsImportInstructionsRpc,
+  WsSkillsUpdateProjectSettingsRpc,
   WsServerSignalProcessRpc,
   WsScheduledTasksListRpc,
   WsScheduledTasksSubscribeRpc,

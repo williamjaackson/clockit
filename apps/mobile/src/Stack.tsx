@@ -70,6 +70,16 @@ import {
 } from "./features/threads/ThreadSettingsSheet";
 import { NewTaskFlowProvider } from "./features/threads/new-task-flow-provider";
 import { NewTaskRouteScreen } from "./features/threads/NewTaskRouteScreen";
+import {
+  SkillDetailRouteScreen,
+  SkillFileRouteScreen,
+} from "./features/skills/SkillDetailRouteScreen";
+import {
+  SkillImportRouteScreen,
+  SkillNewRouteScreen,
+} from "./features/skills/SkillFormRouteScreens";
+import { SkillInstructionsRouteScreen } from "./features/skills/SkillInstructionsRouteScreen";
+import { SkillsRouteScreen } from "./features/skills/SkillsRouteScreen";
 import { SettingsAppearanceRouteScreen } from "./features/settings/SettingsAppearanceRouteScreen";
 import { SettingsClientStorageRouteScreen } from "./features/settings/SettingsClientStorageRouteScreen";
 import { SettingsDiagnosticsRouteScreen } from "./features/diagnostics/SettingsDiagnosticsRouteScreen";
@@ -390,6 +400,36 @@ const SettingsContentStack = createNativeStackNavigator({
       options: {
         title: "Usage",
       },
+    }),
+    SettingsSkills: createNativeStackScreen({
+      screen: SkillsRouteScreen,
+      linking: "skills",
+      options: {
+        title: "Skills",
+      },
+    }),
+    // Skill screens below carry the environment and scope they act on as
+    // params. They have no paths, so a link can't open an editor for a
+    // project the user didn't pick.
+    SettingsSkill: createNativeStackScreen({
+      screen: SkillDetailRouteScreen,
+      options: { title: "Skill" },
+    }),
+    SettingsSkillFile: createNativeStackScreen({
+      screen: SkillFileRouteScreen,
+      options: { title: "File" },
+    }),
+    SettingsSkillInstructions: createNativeStackScreen({
+      screen: SkillInstructionsRouteScreen,
+      options: { title: "Instructions" },
+    }),
+    SettingsSkillNew: createNativeStackScreen({
+      screen: SkillNewRouteScreen,
+      options: { title: "New skill" },
+    }),
+    SettingsSkillImport: createNativeStackScreen({
+      screen: SkillImportRouteScreen,
+      options: { title: "Import" },
     }),
   },
 });

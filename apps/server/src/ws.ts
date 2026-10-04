@@ -218,6 +218,7 @@ import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
 import * as HostResources from "./resourceTelemetry/HostResources.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as UsageService from "./usage/UsageService.ts";
+import * as SkillLibrary from "./skills/SkillLibrary.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
 import { listLinkedPullRequestThreads } from "./pullRequest/linkedThreads.ts";
@@ -1237,6 +1238,7 @@ const makeWsRpcLayer = (
               Effect.orElseSucceed(() => null),
             );
       const usage = yield* UsageService.UsageService;
+      const skillLibrary = yield* SkillLibrary.SkillLibrary;
       const usageLimitSources = yield* UsageLimitSources.UsageLimitSources;
       const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
       const worktreeSetupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
@@ -2629,6 +2631,78 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.serverRefreshUsageRates, usage.refreshRates, {
             "rpc.aggregate": "server",
           }),
+        [WS_METHODS.skillsList]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsList, skillLibrary.list(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsRead]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsRead, skillLibrary.read(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsSave]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsSave, skillLibrary.save(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsImport]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsImport, skillLibrary.importSkill(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsSetEnabled]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsSetEnabled, skillLibrary.setEnabled(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsArchive]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsArchive, skillLibrary.archive(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsRestore]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsRestore, skillLibrary.restore(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsDeleteRecovery]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsDeleteRecovery, skillLibrary.deleteRecovery(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsLink]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsLink, skillLibrary.link(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsUnlink]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsUnlink, skillLibrary.unlink(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsReadInstructions]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsReadInstructions,
+            skillLibrary.readInstructions(input),
+            {
+              "rpc.aggregate": "skills",
+            },
+          ),
+        [WS_METHODS.skillsSaveInstructions]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsSaveInstructions,
+            skillLibrary.saveInstructions(input),
+            {
+              "rpc.aggregate": "skills",
+            },
+          ),
+        [WS_METHODS.skillsImportInstructions]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsImportInstructions,
+            skillLibrary.importInstructions(input),
+            {
+              "rpc.aggregate": "skills",
+            },
+          ),
+        [WS_METHODS.skillsUpdateProjectSettings]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsUpdateProjectSettings,
+            skillLibrary.updateProjectSettings(input),
+            {
+              "rpc.aggregate": "skills",
+            },
+          ),
         [WS_METHODS.serverRetryResourceTelemetry]: (_input) =>
           observeRpcEffect(WS_METHODS.serverRetryResourceTelemetry, resourceTelemetry.retry, {
             "rpc.aggregate": "server",

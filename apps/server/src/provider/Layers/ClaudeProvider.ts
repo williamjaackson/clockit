@@ -37,6 +37,11 @@ import {
 import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
 import { makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import { discoverClaudeSkills } from "../Drivers/ClaudeSkills.ts";
+import {
+  applySkillOverlayToCatalog,
+  claudeSuppressedSkillNames,
+  type PreparedSkillOverlay,
+} from "../ProviderSkillOverlay.ts";
 import type { ProviderWorkspaceSnapshot } from "../ProviderDriver.ts";
 import { makeUnavailableUsageLimits } from "../providerUsageLimits.ts";
 import {
@@ -190,6 +195,8 @@ export function buildClaudeCapabilitiesProbeQueryOptions(input: {
   readonly abortController: AbortController;
   readonly environment: NodeJS.ProcessEnv;
   readonly cwd: string | undefined;
+  /** Workspace skill switches, so discovered commands match a session's. */
+  readonly skillOverrides?: Readonly<Record<string, "off">>;
 }): ClaudeQueryOptions {
   return {
     persistSession: false,
@@ -199,7 +206,12 @@ export function buildClaudeCapabilitiesProbeQueryOptions(input: {
     // The probe keeps filesystem setting sources for slash-command discovery,
     // but must not run the user's hooks: it fires every few minutes, so
     // SessionStart hooks would run on every health check.
-    settings: { disableAllHooks: true },
+    settings: {
+      disableAllHooks: true,
+      ...(input.skillOverrides === undefined
+        ? {}
+        : { skillOverrides: { ...input.skillOverrides } }),
+    },
     allowedTools: [],
     // Ignore MCP definitions from every filesystem setting source above. The
     // SDK combines this empty explicit map with --strict-mcp-config.
@@ -336,6 +348,7 @@ const probeClaudeCapabilities = (
   environment?: NodeJS.ProcessEnv,
   cwd?: string,
   includeUsage = true,
+  skillOverrides?: Readonly<Record<string, "off">>,
 ) => {
   const abort = new AbortController();
   return Effect.gen(function* () {
@@ -357,6 +370,7 @@ const probeClaudeCapabilities = (
           abortController: abort,
           environment: claudeEnvironment,
           cwd,
+          ...(skillOverrides === undefined ? {} : { skillOverrides }),
         }),
       });
       const init = await q.initializationResult();
@@ -429,13 +443,23 @@ export const probeClaudeWorkspaceSnapshot = Effect.fn("probeClaudeWorkspaceSnaps
   machineSnapshot: ServerProvider,
   cwd: string,
   environment?: NodeJS.ProcessEnv,
+  skillOverlay?: PreparedSkillOverlay,
 ): Effect.fn.Return<ProviderWorkspaceSnapshot, never, FileSystem.FileSystem | Path.Path> {
   if (!claudeSettings.enabled) return machineSnapshot;
   const skills = yield* discoverClaudeSkills(claudeSettings, cwd, environment);
-  const capabilities = yield* probeClaudeCapabilities(claudeSettings, environment, cwd, false);
+  const suppressed = [...claudeSuppressedSkillNames(skillOverlay)];
+  const capabilities = yield* probeClaudeCapabilities(
+    claudeSettings,
+    environment,
+    cwd,
+    false,
+    suppressed.length === 0
+      ? undefined
+      : Object.fromEntries(suppressed.map((name) => [name, "off" as const])),
+  );
   return {
     ...machineSnapshot,
-    skills,
+    skills: applySkillOverlayToCatalog(skills, skillOverlay, "claudeAgent"),
     slashCommands: dedupeSlashCommands([
       COMPACT_SLASH_COMMAND,
       ...(capabilities?.slashCommands ?? []),

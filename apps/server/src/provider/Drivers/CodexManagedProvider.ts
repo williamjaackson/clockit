@@ -15,6 +15,10 @@ import {
   probeCodexSkillsForCwd,
 } from "../Layers/CodexProvider.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
+import {
+  applySkillOverlayToCatalog,
+  skillOverlayResolverFromContext,
+} from "../ProviderSkillOverlay.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import { type ProviderDriverCreateInput, type ProviderInstance } from "../ProviderDriver.ts";
 import { codexContinuationIdentity } from "./CodexHomeLayout.ts";
@@ -217,9 +221,11 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
   const resolveRuntime = runtime.auth.controller.withAccess!(runtime.resolve);
   // Launch settings resolve per session from the signed-in token. The registry
   // already wraps openSession in withAccess, so resolve without re-entering it.
+  const resolveSkillOverlay = yield* skillOverlayResolverFromContext;
   const orchestrationAdapter = yield* createCodexAdapterV2(input, {
     onUsageLimits: (update) => snapshot.applyUsageLimits(update),
     resolveRuntime: runtime.resolve,
+    ...(resolveSkillOverlay === undefined ? {} : { resolveSkillOverlay }),
   }).pipe(
     Effect.mapError(
       (cause) =>
@@ -282,7 +288,15 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
               }),
             ),
             Effect.flatMap((skills) =>
-              snapshot.getSnapshot.pipe(Effect.map((draft) => ({ ...draft, skills }))),
+              Effect.all([
+                snapshot.getSnapshot,
+                resolveSkillOverlay === undefined ? Effect.undefined : resolveSkillOverlay(cwd),
+              ]).pipe(
+                Effect.map(([draft, skillOverlay]) => ({
+                  ...draft,
+                  skills: applySkillOverlayToCatalog(skills, skillOverlay, "codex"),
+                })),
+              ),
             ),
             Effect.scoped,
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),

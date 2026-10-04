@@ -89,7 +89,18 @@ import * as Stream from "effect/Stream";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExecutable.ts";
 import { planClaudeSkillDispatch } from "../../provider/Drivers/ClaudeSkillDispatch.ts";
-import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
+import {
+  discoverClaudeSkills,
+  resolveClaudeConfigDirPath,
+} from "../../provider/Drivers/ClaudeSkills.ts";
+import {
+  type ClaudeSkillOverlayQuery,
+  claudeSkillOverlayQuery,
+  claudeSuppressedSkillNames,
+  type PreparedSkillOverlay,
+  privateSkillInvocationText,
+  type SkillOverlayResolver,
+} from "../../provider/ProviderSkillOverlay.ts";
 import { compileClaudeModelSelection } from "../../claudeModelOptions.ts";
 import * as ServerConfig from "../../config.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
@@ -825,6 +836,8 @@ export function makeClaudeQueryOptions(input: {
   readonly onUserDialog?: ClaudeQueryOptions["onUserDialog"];
   readonly supportedDialogKinds?: ClaudeQueryOptions["supportedDialogKinds"];
   readonly allowDangerouslySkipPermissions?: boolean;
+  /** Private project instructions and skills, after T3's own instructions. */
+  readonly appendSystemPrompt?: string;
 }): ClaudeAgentSdkQueryOptions {
   const compiledSelection = compileClaudeModelSelection(input.modelSelection);
   const {
@@ -909,7 +922,8 @@ export function makeClaudeQueryOptions(input: {
       preset: "claude_code" as const,
       append:
         buildRuntimeInstructions({ harness: "Claude Code" }) +
-        (input.mcpServers === undefined ? "" : T3_CODE_ORCHESTRATION_INSTRUCTIONS),
+        (input.mcpServers === undefined ? "" : T3_CODE_ORCHESTRATION_INSTRUCTIONS) +
+        (input.appendSystemPrompt === undefined ? "" : `\n\n${input.appendSystemPrompt}`),
     },
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };
@@ -920,6 +934,23 @@ export function makeClaudeQueryOptions(input: {
   const withDirectories =
     additionalDirectories.length === 0 ? options : { ...options, additionalDirectories };
   return input.cwd === null ? withDirectories : { ...withDirectories, cwd: input.cwd };
+}
+
+/** Flag-level settings for a project's private skills and instructions. */
+function claudeOverlayQueryOptions(
+  settings: Extract<ClaudeSkillOverlayQuery, { readonly _tag: "Applied" }>["settings"],
+): { readonly sdkSettings?: ClaudeSdkSettings } {
+  if (settings.skillOverrides === undefined && settings.claudeMdExcludes === undefined) return {};
+  return {
+    sdkSettings: {
+      ...(settings.skillOverrides === undefined
+        ? {}
+        : { skillOverrides: { ...settings.skillOverrides } }),
+      ...(settings.claudeMdExcludes === undefined
+        ? {}
+        : { claudeMdExcludes: [...settings.claudeMdExcludes] }),
+    },
+  };
 }
 
 export const CLAUDE_T3_MCP_TOOL_WILDCARD = "mcp__t3-code__*";
@@ -1228,6 +1259,8 @@ export function makeClaudeUserMessage(input: {
   readonly text: string;
   readonly priority?: SDKUserMessage["priority"];
   readonly skillNames?: ReadonlySet<string>;
+  /** Stands in for invoking a private project skill; see ProviderSkillOverlay. */
+  readonly privateSkillText?: string;
   // Claude echoes it as user_message_uuid on the turn that answers it.
   readonly uuid?: SDKUserMessage["uuid"];
 }): SDKUserMessage {
@@ -1235,22 +1268,30 @@ export function makeClaudeUserMessage(input: {
   // `/name` is its first character. A `$skill` chip anywhere in the prompt is
   // therefore split into [leading text, "/name trailing text"] so the CLI
   // runs it natively and the prose around it survives. See ClaudeSkillDispatch.
+  // A private skill's instruction goes first, keeping the command block last.
   const dispatch =
     input.skillNames === undefined
       ? undefined
       : planClaudeSkillDispatch(input.text, input.skillNames);
+  const privateSkillBlocks =
+    input.privateSkillText === undefined
+      ? []
+      : [{ type: "text" as const, text: input.privateSkillText }];
   return {
     type: "user",
     message: {
       role: "user",
       content: dispatch
         ? [
+            ...privateSkillBlocks,
             ...(dispatch.leadingText === undefined
               ? []
               : [{ type: "text" as const, text: dispatch.leadingText }]),
             { type: "text" as const, text: dispatch.commandText },
           ]
-        : input.text,
+        : privateSkillBlocks.length > 0
+          ? [...privateSkillBlocks, { type: "text" as const, text: input.text }]
+          : input.text,
     },
     parent_tool_use_id: null,
     ...(input.priority === undefined ? {} : { priority: input.priority }),
@@ -1266,11 +1307,13 @@ const makeClaudeUserMessageWithAttachments = Effect.fnUntraced(function* (input:
   readonly attachmentsDir: string;
   readonly fileSystem: FileSystem.FileSystem;
   readonly skillNames?: ReadonlySet<string>;
+  readonly privateSkillText?: string;
 }) {
   if (input.attachments.length === 0) {
     return makeClaudeUserMessage({
       text: input.text,
       ...(input.skillNames === undefined ? {} : { skillNames: input.skillNames }),
+      ...(input.privateSkillText === undefined ? {} : { privateSkillText: input.privateSkillText }),
       ...(input.priority === undefined ? {} : { priority: input.priority }),
       ...(input.uuid === undefined ? {} : { uuid: input.uuid }),
     });
@@ -1290,6 +1333,9 @@ const makeClaudeUserMessageWithAttachments = Effect.fnUntraced(function* (input:
       ? undefined
       : planClaudeSkillDispatch(textWithAttachmentPaths, input.skillNames);
   const content: Array<ClaudeUserContentBlock> = [];
+  if (input.privateSkillText !== undefined) {
+    content.push({ type: "text", text: input.privateSkillText });
+  }
   if (dispatch?.leadingText !== undefined) {
     content.push({ type: "text", text: dispatch.leadingText });
   }
@@ -2732,6 +2778,8 @@ interface ClaudeLiveQueryContext {
   readonly query: ClaudeAgentSdkQuerySession;
   readonly queryPolicyKey: string;
   readonly selectionKey: string;
+  // Private project skills and instructions this process was opened with.
+  readonly skillOverlayKey: string | null;
   readonly closed: Deferred.Deferred<void, never>;
   // Whether this CLI process echoes a prompt's uuid on the first frame of
   // the turn answering it ("early") or only on its result. Learned from the
@@ -2951,6 +2999,8 @@ export interface ClaudeAdapterV2Options {
   readonly queryRunner: ClaudeAgentSdkQueryRunnerShape;
   readonly scopedLimitNames?: Ref.Ref<ClaudeScopedLimitNames>;
   readonly onUsageLimits?: ServerProviderShape["applyUsageLimits"];
+  /** Private project customization for a cwd; omitted means none anywhere. */
+  readonly resolveSkillOverlay?: SkillOverlayResolver;
   /** Sink for wake-turn continuation requests; defaults to dropping them. */
   readonly continuationRequests?: {
     readonly offer: (
@@ -2970,24 +3020,33 @@ export function makeClaudeAdapterV2(
   // Re-scan on every send: skills are added and switched off mid-session, and
   // the scan is a few directory reads. A skill switched off via skillOverrides,
   // or reserved for the agent with `user-invocable: false`, is left as prose:
-  // the CLI would answer `/name` with a notice instead of running it.
-  const userInvocableSkillNames = (cwd: string | null) =>
+  // the CLI would answer `/name` with a notice instead of running it. So is
+  // a name a private project skill switched off: T3 invokes the private copy.
+  const userInvocableSkillNames = (cwd: string | null, overlay: PreparedSkillOverlay | undefined) =>
     discoverClaudeSkills(
       adapterOptions.settings,
       cwd ?? undefined,
       adapterOptions.environment,
     ).pipe(
-      Effect.map(
-        (skills) =>
-          new Set(
-            skills
-              .filter((skill) => skill.enabled && skill.userInvocable !== false)
-              .map((skill) => skill.name),
-          ),
-      ),
+      Effect.map((skills) => {
+        const suppressed = claudeSuppressedSkillNames(overlay);
+        return new Set(
+          skills
+            .filter(
+              (skill) =>
+                skill.enabled && skill.userInvocable !== false && !suppressed.has(skill.name),
+            )
+            .map((skill) => skill.name),
+        );
+      }),
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
     );
+
+  const resolveSkillOverlay = (cwd: string | null) =>
+    cwd === null || adapterOptions.resolveSkillOverlay === undefined
+      ? Effect.succeed<PreparedSkillOverlay | undefined>(undefined)
+      : adapterOptions.resolveSkillOverlay(cwd);
 
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: adapterOptions.instanceId,
@@ -6898,7 +6957,21 @@ export function makeClaudeAdapterV2(
         const openQuery = Effect.fnUntraced(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
           nativeThreadId: string,
+          skillOverlay: PreparedSkillOverlay | undefined,
         ) {
+          const overlayQuery =
+            skillOverlay === undefined
+              ? undefined
+              : claudeSkillOverlayQuery(
+                  skillOverlay,
+                  yield* resolveClaudeConfigDirPath(
+                    adapterOptions.settings,
+                    adapterOptions.environment,
+                    turnInput.runtimePolicy.cwd ?? undefined,
+                  ).pipe(Effect.provideService(Path.Path, path)),
+                  path,
+                );
+          const skillOverlayKey = skillOverlay?.key ?? null;
           const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
           const mcpOverrides = claudeMcpQueryOverrides({
             threadId: turnInput.threadId,
@@ -6925,7 +6998,12 @@ export function makeClaudeAdapterV2(
             existing !== null &&
             existing.nativeThreadId === nativeThreadId &&
             existing.queryPolicyKey === queryPolicyKey &&
-            existing.selectionKey === compiledSelection.queryIdentity
+            existing.selectionKey === compiledSelection.queryIdentity &&
+            // Changed private skills or instructions reopen the process, but
+            // never under running background work: they wait for a turn
+            // that can reopen it safely.
+            (existing.skillOverlayKey === skillOverlayKey ||
+              (!existing.stopping && (yield* liveProcessRunsBackgroundWork(existing))))
           ) {
             // Claude can switch its own mode mid-session (EnterPlanMode), and
             // a denied ExitPlanMode leaves it there. Put the live process back
@@ -6935,6 +7013,15 @@ export function makeClaudeAdapterV2(
               existing.permissionMode = existing.openedPermissionMode;
             }
             return existing;
+          }
+
+          // Refuse before touching the live process, rather than open one
+          // that would load instruction files the user switched off.
+          if (overlayQuery?._tag === "Unsupported") {
+            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+              driver: CLAUDE_PROVIDER,
+              detail: overlayQuery.detail,
+            });
           }
 
           // Background agents and shells run inside the CLI process, so a
@@ -6996,6 +7083,10 @@ export function makeClaudeAdapterV2(
             canUseTool,
             onUserDialog,
             supportedDialogKinds: ["resume_return"],
+            ...(overlayQuery === undefined ? {} : claudeOverlayQueryOptions(overlayQuery.settings)),
+            ...(overlayQuery?.appendSystemPrompt === undefined
+              ? {}
+              : { appendSystemPrompt: overlayQuery.appendSystemPrompt }),
           });
           const querySession = yield* queryRunner
             .open({
@@ -7046,6 +7137,7 @@ export function makeClaudeAdapterV2(
             query: querySession,
             queryPolicyKey,
             selectionKey: compiledSelection.queryIdentity,
+            skillOverlayKey,
             closed,
             promptEchoMode: "unknown",
             openedPermissionMode: queryOptions.permissionMode,
@@ -7169,6 +7261,11 @@ export function makeClaudeAdapterV2(
             // messages into this turn and let any still-streaming messages
             // follow live. The continuation prompt text never reaches the CLI.
             const isContinuationTurn = context.promptUuid === null;
+            const skillOverlay = yield* resolveSkillOverlay(turnInput.runtimePolicy.cwd);
+            const privateSkillText = privateSkillInvocationText(
+              turnInput.message.text,
+              skillOverlay,
+            );
             const userMessage = isContinuationTurn
               ? null
               : yield* makeClaudeUserMessageWithAttachments({
@@ -7179,10 +7276,14 @@ export function makeClaudeAdapterV2(
                   attachments: turnInput.message.attachments,
                   attachmentsDir,
                   fileSystem,
-                  skillNames: yield* userInvocableSkillNames(turnInput.runtimePolicy.cwd),
+                  skillNames: yield* userInvocableSkillNames(
+                    turnInput.runtimePolicy.cwd,
+                    skillOverlay,
+                  ),
+                  ...(privateSkillText === undefined ? {} : { privateSkillText }),
                   uuid: claudePromptUuid(turnInput.attemptId),
                 });
-            const querySession = yield* openQuery(turnInput, nativeThreadId);
+            const querySession = yield* openQuery(turnInput, nativeThreadId, skillOverlay);
             yield* Ref.set(activeTurn, context);
             yield* emitProviderEvent({
               type: "provider_turn.updated",
@@ -7380,6 +7481,11 @@ export function makeClaudeAdapterV2(
                 detail: `Claude provider turn ${turnInput.providerTurnId} is not the active turn.`,
               });
             }
+            const skillOverlay = yield* resolveSkillOverlay(currentTurn.input.runtimePolicy.cwd);
+            const privateSkillText = privateSkillInvocationText(
+              turnInput.message.text,
+              skillOverlay,
+            );
             const userMessage = yield* makeClaudeUserMessageWithAttachments({
               text: applyClaudePromptEffortPrefix(
                 turnInput.message.text,
@@ -7389,7 +7495,11 @@ export function makeClaudeAdapterV2(
               priority: "now",
               attachmentsDir,
               fileSystem,
-              skillNames: yield* userInvocableSkillNames(currentTurn.input.runtimePolicy.cwd),
+              skillNames: yield* userInvocableSkillNames(
+                currentTurn.input.runtimePolicy.cwd,
+                skillOverlay,
+              ),
+              ...(privateSkillText === undefined ? {} : { privateSkillText }),
             });
             yield* Ref.update(steeredTurns, (current) => {
               const next = new Set(current);
@@ -7773,7 +7883,10 @@ export type ClaudeAdapterV2DriverEnv =
 export const createClaudeAdapterV2 = Effect.fn("ClaudeAdapterV2Driver.create")(
   function* (
     input: ProviderAdapterDriverCreateInput<ClaudeSettings>,
-    hooks: Pick<ClaudeAdapterV2Options, "scopedLimitNames" | "onUsageLimits"> = {},
+    hooks: Pick<
+      ClaudeAdapterV2Options,
+      "scopedLimitNames" | "onUsageLimits" | "resolveSkillOverlay"
+    > = {},
   ) {
     const { instanceId, environment, enabled, config } = input;
     const fileSystem = yield* FileSystem.FileSystem;

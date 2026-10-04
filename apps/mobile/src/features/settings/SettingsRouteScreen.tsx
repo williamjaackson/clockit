@@ -207,6 +207,7 @@ function SettingsIndexSections() {
 
       <SettingsSection title="App">
         <SettingsRow icon="chart.bar.xaxis" label="Usage" target="SettingsUsage" />
+        <SettingsRow icon="hammer" label="Skills" target="SettingsSkills" />
         <SettingsRow icon="info.circle" label="About T3 Code" target="SettingsAbout" />
       </SettingsSection>
     </>
