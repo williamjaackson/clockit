@@ -9,6 +9,10 @@
  * - `skill-projects/<hash>/`: private project state, keyed by the canonical
  *   project root. Holds `skills/`, `disabled-skills/`, `AGENTS.md`, and
  *   `manifest.json`. Only T3 agents see it, through `resolveProjectOverlay`.
+ *   Agents in a folder use the nearest profile at or above it, and in a Git
+ *   worktree the primary checkout's matching folder's as well. Managing a
+ *   folder edits that same profile, so a sub-project or worktree without one
+ *   of its own edits the one its agents inherit.
  * - `skill-recovery/<id>/`: archived skills and originals moved aside to
  *   make room for a link, each restorable.
  * - `skill-library.json`: links to restore when a disabled skill comes back.
@@ -24,7 +28,8 @@
  * such as `.claude/skills` happens only on an explicit link request.
  *
  * Mutations run one at a time. Each journals its filesystem and metadata
- * changes and undoes them in reverse if anything fails, snapshot included.
+ * changes and undoes them in reverse if anything fails, snapshot included,
+ * and is announced on `streamChanges` only once it has committed.
  *
  * @module skills/SkillLibrary
  */
@@ -76,13 +81,16 @@ import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hos
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
+import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 
 import { writeFileStringAtomically } from "../atomicWrite.ts";
 import * as ServerConfig from "../config.ts";
@@ -154,9 +162,10 @@ const RecoveryRecordJson = Schema.fromJsonString(RecoveryRecord);
  * What a provider adapter applies for a T3 agent working in a project with
  * private customization. Absent when the project has none.
  *
- * `projectRoot` is the checkout the agent works in, and every repository path
- * here is inside it. When a Git worktree inherits its primary checkout's
- * profile, `privateRoot` and `provenance.profileRoot` still name the primary.
+ * `projectRoot` is the folder in the agent's checkout the profile applies to,
+ * the working folder or one above it, and every repository path here is inside
+ * it. When a Git worktree inherits its primary checkout's profile,
+ * `privateRoot` and `provenance.profileRoot` still name the primary.
  */
 export interface ProjectSkillOverlay {
   readonly projectRoot: string;
@@ -171,13 +180,17 @@ export interface ProjectSkillOverlay {
     readonly invocationName?: string;
   }>;
   /**
-   * Repository skills to hide from T3 agents, by the name providers load them
-   * under. `disabled` entries name the repository folder; `replaced` entries
-   * are shadowed by a private skill with the same invocation name wherever
-   * the repository keeps them.
+   * Repository skills to hide from T3 agents. `name` is the invocation name,
+   * which Codex and the catalog match on; `folderName` is the repository
+   * folder, which Claude Code names a skill by. `disabled` entries are folders
+   * the user switched off. `replaced` entries are shadowed by a private skill
+   * with the same invocation name: one entry with `path: null` covers the
+   * name wherever the repository keeps it, and one entry per repository
+   * folder found carries its path and `folderName`.
    */
   readonly suppressedRepoSkills: ReadonlyArray<{
     readonly name: string;
+    readonly folderName?: string;
     readonly path: string | null;
     readonly reason: "disabled" | "replaced";
   }>;
@@ -193,9 +206,20 @@ export interface ProjectSkillOverlay {
     readonly manifestPath: string;
     /** The project the private profile belongs to. */
     readonly profileRoot?: string;
-    /** `worktree` when an uncustomized Git worktree inherits its primary checkout's profile. */
+    /** `worktree` when a Git worktree uses its primary checkout's profile. */
     readonly source?: "project" | "worktree";
   };
+}
+
+/**
+ * One committed mutation. No `projectRoot` means global state changed, which
+ * can affect every project. `profileRoot` is set for private project changes
+ * and matches `ProjectSkillOverlay.provenance.profileRoot`: worktrees that
+ * use that profile are affected too, not only `projectRoot`.
+ */
+export interface SkillLibraryChange {
+  readonly projectRoot?: string;
+  readonly profileRoot?: string;
 }
 
 export class SkillLibrary extends Context.Service<
@@ -240,23 +264,49 @@ export class SkillLibrary extends Context.Service<
     ) => Effect.Effect<SkillsSnapshot, SkillsError>;
     /**
      * Private customization for the project containing `cwd`. Walks up from
-     * its canonical path; a Git worktree with no profile of its own inherits
-     * its primary checkout's. `None` when nothing would change. Reads only.
+     * its canonical path, nearest folder first, through the same profile
+     * locations the management methods use, so a Git worktree gets its
+     * primary checkout's profile. `None` when nothing would change. Reads only.
      */
     readonly resolveProjectOverlay: (
       cwd: string,
     ) => Effect.Effect<Option.Option<ProjectSkillOverlay>, SkillsError>;
+    /**
+     * Every committed mutation, published once the mutation lock is free.
+     * Rejected and failed mutations publish nothing, and neither do reads.
+     */
+    readonly streamChanges: Stream.Stream<SkillLibraryChange>;
   }
 >()("t3/skills/SkillLibrary") {}
 
 interface ResolvedScope {
   readonly kind: "global" | "project";
   readonly mode: "local" | "shared" | undefined;
+  /** The checkout the request names. Repository paths are relative to it. */
   readonly projectRoot: string | undefined;
+  /**
+   * The folder in this checkout the profile applies to: `projectRoot` or an
+   * enclosing folder. The manifest's repository paths are relative to it,
+   * exactly as in the overlay.
+   */
+  readonly activeRoot: string | undefined;
+  /**
+   * The folder whose private state this scope uses: `activeRoot`, or the
+   * primary checkout's matching folder when `activeRoot` is in a Git worktree.
+   */
+  readonly profileRoot: string | undefined;
+  readonly profileSource: "project" | "worktree" | undefined;
   readonly privateDir: string | undefined;
   /** Enabled library skills: global, private, or the repository's `.agents/skills` when shared. */
   readonly libraryDir: string;
   readonly disabledDir: string | undefined;
+}
+
+interface ProfileLocation {
+  /** The folder in the checkout the profile applies to. */
+  readonly activeRoot: string;
+  readonly profileRoot: string;
+  readonly source: "project" | "worktree";
 }
 
 type PathState =
@@ -322,6 +372,10 @@ const make = Effect.gen(function* () {
   const hostPlatform = yield* HostProcessPlatform;
   const services = yield* Effect.context<FileSystem.FileSystem | Path.Path>();
   const mutex = yield* Semaphore.make(1);
+  const changes = yield* Effect.acquireRelease(
+    PubSub.unbounded<SkillLibraryChange>(),
+    PubSub.shutdown,
+  );
 
   const baseDir = path.resolve(config.baseDir);
   const libraryDir = path.join(baseDir, "skills");
@@ -345,6 +399,9 @@ const make = Effect.gen(function* () {
     kind: "global",
     mode: undefined,
     projectRoot: undefined,
+    activeRoot: undefined,
+    profileRoot: undefined,
+    profileSource: undefined,
     privateDir: undefined,
     libraryDir,
     disabledDir,
@@ -515,6 +572,38 @@ const make = Effect.gen(function* () {
       Effect.mapError(fsError("Could not write a file.", filePath)),
     );
 
+  /**
+   * Write a file inside a transaction. The journal puts back its previous
+   * bytes, or removes it and the topmost folder this write had to create.
+   */
+  const writeTextJournaled = (filePath: string, contents: string, journal: Journal) =>
+    Effect.gen(function* () {
+      let createdDir: string | undefined;
+      for (let directory = path.dirname(filePath); ; directory = path.dirname(directory)) {
+        if ((yield* pathState(directory)).kind !== "missing") break;
+        createdDir = directory;
+        if (path.dirname(directory) === directory) break;
+      }
+      if (createdDir !== undefined) {
+        yield* ensureDir(path.dirname(filePath));
+        journal.push(fileSystem.remove(createdDir, { recursive: true }));
+      }
+      const previous = yield* fileSystem.readFile(filePath).pipe(
+        Effect.asSome,
+        Effect.catchIf(
+          (error) => error.reason._tag === "NotFound",
+          () => Effect.succeedNone,
+        ),
+        Effect.mapError(fsError("Could not read a file.", filePath)),
+      );
+      yield* writeText(filePath, contents);
+      journal.push(
+        Option.isSome(previous)
+          ? fileSystem.writeFile(filePath, previous.value)
+          : fileSystem.remove(filePath, { force: true }),
+      );
+    });
+
   /** Text content, `undefined` when the file is missing. Follows symlinks. */
   const readTextIfExists = (filePath: string) =>
     Effect.gen(function* () {
@@ -587,14 +676,47 @@ const make = Effect.gen(function* () {
       }
     });
 
-  /** Run `body`, undoing its journaled changes when it fails. */
-  const transact = <A>(body: (journal: Journal) => Effect.Effect<A, SkillsError>) =>
+  const locked = <A>(effect: Effect.Effect<A, SkillsError>) => mutex.withPermits(1)(effect);
+
+  const changeOf = (scope: ResolvedScope): SkillLibraryChange =>
+    scope.projectRoot === undefined
+      ? {}
+      : scope.mode === "local"
+        ? { projectRoot: scope.projectRoot, profileRoot: scope.profileRoot! }
+        : { projectRoot: scope.projectRoot };
+
+  /**
+   * Run one mutation of `scope` under the lock, undoing its journaled changes
+   * when it fails, then announce it. Subscribers hear only about committed
+   * changes, and only once the lock is free again. The outcome is recorded as
+   * the body exits, so a caller interrupted after the commit still announces
+   * it, and one interrupted before it rolls back.
+   */
+  const mutate = <A>(
+    input: SkillScope,
+    body: (scope: ResolvedScope, journal: Journal) => Effect.Effect<A, SkillsError>,
+  ) =>
     Effect.suspend(() => {
       const journal: Journal = [];
-      return body(journal).pipe(Effect.onError(() => rollback(journal)));
+      let committed: SkillLibraryChange | undefined;
+      return locked(
+        Effect.flatMap(resolveScope(input), (scope) =>
+          body(scope, journal).pipe(
+            Effect.onExit((exit) => {
+              if (Exit.isFailure(exit)) return rollback(journal);
+              committed = changeOf(scope);
+              return Effect.void;
+            }),
+          ),
+        ),
+      ).pipe(
+        Effect.ensuring(
+          Effect.suspend(() =>
+            committed === undefined ? Effect.void : PubSub.publish(changes, committed),
+          ),
+        ),
+      );
     });
-
-  const locked = <A>(effect: Effect.Effect<A, SkillsError>) => mutex.withPermits(1)(effect);
 
   // ── persisted state ──────────────────────────────────────────────────
 
@@ -623,17 +745,9 @@ const make = Effect.gen(function* () {
       const contents = yield* encode(value).pipe(
         Effect.mapError(fsError("Could not encode a skill library file.", filePath)),
       );
-      if (journal !== undefined) {
-        const previous = yield* readTextIfExists(filePath);
-        yield* writeText(filePath, contents);
-        journal.push(
-          previous === undefined
-            ? fileSystem.remove(filePath, { force: true })
-            : writeText(filePath, previous),
-        );
-        return;
-      }
-      yield* writeText(filePath, contents);
+      yield* journal === undefined
+        ? writeText(filePath, contents)
+        : writeTextJournaled(filePath, contents, journal);
     });
 
   const decodeLibraryState = Schema.decodeUnknownEffect(LibraryStateJson);
@@ -662,22 +776,22 @@ const make = Effect.gen(function* () {
     );
 
   const readManifest = (scope: ResolvedScope) =>
-    scope.projectRoot === undefined
+    scope.profileRoot === undefined
       ? Effect.undefined
       : Effect.map(
-          exactManifest(scope.projectRoot),
-          (manifest) => manifest ?? defaultManifest(scope.projectRoot!),
+          exactManifest(scope.profileRoot),
+          (manifest) => manifest ?? defaultManifest(scope.profileRoot!),
         );
 
-  const writeManifest = (scope: ResolvedScope, manifest: ProjectManifest, journal?: Journal) =>
+  const writeManifest = (scope: ResolvedScope, manifest: ProjectManifest, journal: Journal) =>
     writeJsonFile(path.join(scope.privateDir!, "manifest.json"), encodeManifest, manifest, journal);
 
   /** The manifest marks a project as customized, so write it with any private change. */
-  const ensureProjectState = (scope: ResolvedScope, journal?: Journal) =>
+  const ensureProjectState = (scope: ResolvedScope, journal: Journal) =>
     Effect.gen(function* () {
-      if (scope.mode !== "local" || scope.projectRoot === undefined) return;
-      if ((yield* exactManifest(scope.projectRoot)) === undefined) {
-        yield* writeManifest(scope, defaultManifest(scope.projectRoot), journal);
+      if (scope.mode !== "local" || scope.profileRoot === undefined) return;
+      if ((yield* exactManifest(scope.profileRoot)) === undefined) {
+        yield* writeManifest(scope, defaultManifest(scope.profileRoot), journal);
       }
     });
 
@@ -696,7 +810,14 @@ const make = Effect.gen(function* () {
       return record.value;
     });
 
-  const listRecovery = (projectRoot: string | undefined) =>
+  /**
+   * Which root a recovery item belongs to: archived private skills to the
+   * profile, originals moved aside to the checkout they were in.
+   */
+  const recoveryOwner = (scope: ResolvedScope, kind: RecoveryRecord["kind"]) =>
+    kind === "archivedSkill" ? scope.profileRoot : scope.projectRoot;
+
+  const listRecovery = (scope: ResolvedScope) =>
     Effect.gen(function* () {
       const ids = yield* fileSystem
         .readDirectory(recoveryDir)
@@ -708,7 +829,10 @@ const make = Effect.gen(function* () {
           path.join(recoveryDir, id, "entry.json"),
           decodeRecovery,
         ).pipe(Effect.orElseSucceed(() => Option.none<RecoveryRecord>()));
-        if (Option.isSome(record) && record.value.projectRoot === projectRoot) {
+        if (
+          Option.isSome(record) &&
+          record.value.projectRoot === recoveryOwner(scope, record.value.kind)
+        ) {
           records.push(toRecoveryEntry(record.value));
         }
       }
@@ -797,6 +921,87 @@ const make = Effect.gen(function* () {
         .pipe(Effect.mapError(fsError("Could not resolve the project folder.", expanded)));
     });
 
+  /**
+   * The primary checkout of the linked Git worktree rooted at `checkoutRoot`,
+   * read from the worktree's `.git` file and the `commondir` it points to.
+   * `undefined` for primary checkouts, submodules, and bare repositories.
+   */
+  const primaryCheckoutOf = (checkoutRoot: string) =>
+    Effect.gen(function* () {
+      const dotGit = path.join(checkoutRoot, ".git");
+      if ((yield* pathState(dotGit)).kind !== "file") return undefined;
+      const pointer = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec((yield* readSmallText(dotGit)) ?? "");
+      if (!pointer?.[1]) return undefined;
+      const gitDir = path.resolve(checkoutRoot, pointer[1]);
+      const common = (yield* readSmallText(path.join(gitDir, "commondir")))?.trim();
+      if (!common) return undefined;
+      const commonDir = path.resolve(gitDir, common);
+      if (path.basename(commonDir) !== ".git") return undefined;
+      const primary = yield* realOrUndefined(path.dirname(commonDir));
+      return primary === checkoutRoot ? undefined : primary;
+    });
+
+  /**
+   * Where private profiles for `start` and each folder above it would live,
+   * nearest folder first. A folder's own profile comes first; inside a linked
+   * Git worktree, the primary checkout's matching folder follows it. Managing
+   * a project and running agents in it both read this, so they always agree.
+   */
+  const profileLocations = (start: string) =>
+    Effect.gen(function* () {
+      const ancestors = [start];
+      for (let parent = path.dirname(start); parent !== ancestors.at(-1);) {
+        ancestors.push(parent);
+        parent = path.dirname(parent);
+      }
+      let worktree: { readonly root: string; readonly primary: string } | undefined;
+      for (const directory of ancestors) {
+        const primary = yield* primaryCheckoutOf(directory);
+        if (primary !== undefined) {
+          worktree = { root: directory, primary };
+          break;
+        }
+      }
+      return ancestors.flatMap((activeRoot): Array<ProfileLocation> => [
+        { activeRoot, profileRoot: activeRoot, source: "project" },
+        ...(worktree !== undefined && isWithinOrEqual(worktree.root, activeRoot)
+          ? [
+              {
+                activeRoot,
+                profileRoot: path.join(worktree.primary, path.relative(worktree.root, activeRoot)),
+                source: "worktree" as const,
+              },
+            ]
+          : []),
+      ]);
+    });
+
+  /** The nearest profile that exists for `start`, in `profileLocations` order. */
+  const existingProfile = (start: string) =>
+    Effect.gen(function* () {
+      for (const location of yield* profileLocations(start)) {
+        const manifest = yield* exactManifest(location.profileRoot);
+        if (manifest !== undefined) return { ...location, manifest };
+      }
+      return undefined;
+    });
+
+  /**
+   * The profile a project's private customization lives in: the one its T3
+   * agents already use, which may belong to an enclosing folder or to the
+   * primary checkout. With none yet, the primary checkout's matching folder
+   * inside a Git worktree, else the project's own. Editing therefore never
+   * swaps the settings agents already get for an empty profile.
+   */
+  const profileFor = (projectRoot: string) =>
+    Effect.gen(function* () {
+      const existing = yield* existingProfile(projectRoot);
+      if (existing !== undefined) return existing;
+      return (yield* profileLocations(projectRoot))
+        .filter((location) => location.activeRoot === projectRoot)
+        .at(-1)!;
+    });
+
   const resolveScope = (scope: SkillScope) =>
     Effect.gen(function* () {
       if (scope.projectPath === undefined) {
@@ -806,12 +1011,20 @@ const make = Effect.gen(function* () {
         return globalScope;
       }
       const projectRoot = yield* resolveProjectRoot(scope.projectPath);
-      const privateDir = privateDirFor(projectRoot);
       const mode = scope.mode ?? "local";
+      // Shared mode has no profile; its recovery items belong to the checkout.
+      const profile =
+        mode === "local"
+          ? yield* profileFor(projectRoot)
+          : { activeRoot: projectRoot, profileRoot: projectRoot, source: "project" as const };
+      const privateDir = privateDirFor(profile.profileRoot);
       return {
         kind: "project",
         mode,
         projectRoot,
+        activeRoot: profile.activeRoot,
+        profileRoot: profile.profileRoot,
+        profileSource: mode === "local" ? profile.source : undefined,
         privateDir,
         libraryDir:
           mode === "shared"
@@ -820,6 +1033,21 @@ const make = Effect.gen(function* () {
         disabledDir: mode === "shared" ? undefined : path.join(privateDir, "disabled-skills"),
       } satisfies ResolvedScope;
     });
+
+  /**
+   * Where a skill's origins sit in the checkout, as the manifest records them:
+   * relative to the profile's active root and `/`-separated.
+   */
+  const repositoryPaths = (
+    scope: ResolvedScope,
+    origins: ReadonlyArray<{ readonly entryPath: string }>,
+  ) => {
+    const activeRoot = scope.activeRoot;
+    if (activeRoot === undefined) return [];
+    return origins
+      .filter((origin) => isWithin(activeRoot, origin.entryPath))
+      .map((origin) => path.relative(activeRoot, origin.entryPath).replaceAll("\\", "/"));
+  };
 
   const requireNotShared = (scope: ResolvedScope, detail: string) =>
     scope.mode === "shared" ? Effect.fail(skillsError("unsupported", detail)) : Effect.void;
@@ -965,14 +1193,7 @@ const make = Effect.gen(function* () {
               (yield* oneHopTarget(origin.entryPath, origin.symlinkTarget)) === canonicalPhysical,
           });
         }
-        const repoPaths =
-          realProjectRoot === undefined
-            ? []
-            : skill.origins
-                .filter((origin) => isWithin(realProjectRoot, origin.entryPath))
-                .map((origin) =>
-                  path.relative(realProjectRoot, origin.entryPath).replaceAll("\\", "/"),
-                );
+        const repoPaths = repositoryPaths(scope, skill.origins);
         const enabled = managedInfo
           ? managedInfo.enabled
           : manifest === undefined ||
@@ -1044,6 +1265,9 @@ const make = Effect.gen(function* () {
         kind: scope.kind,
         ...(scope.mode === undefined ? {} : { mode: scope.mode }),
         ...(scope.projectRoot === undefined ? {} : { projectRoot: scope.projectRoot }),
+        ...(scope.profileSource === undefined
+          ? {}
+          : { profileRoot: scope.profileRoot!, profileSource: scope.profileSource }),
         libraryPath: scope.libraryDir,
       };
       return {
@@ -1056,7 +1280,7 @@ const make = Effect.gen(function* () {
           instructionTargets,
         }),
         instructions,
-        recovery: yield* listRecovery(scope.projectRoot),
+        recovery: yield* listRecovery(scope),
         warnings: budget.warnings,
       };
     }).pipe(Effect.provideContext(services));
@@ -1263,9 +1487,8 @@ const make = Effect.gen(function* () {
     });
 
   const save: SkillLibrary["Service"]["save"] = (input) =>
-    locked(
+    mutate(input.scope, (scope, journal) =>
       Effect.gen(function* () {
-        const scope = yield* resolveScope(input.scope);
         const file = input.file ?? "SKILL.md";
         const segments = yield* validateRelativeFile(file);
         let skillDir: string;
@@ -1299,9 +1522,8 @@ const make = Effect.gen(function* () {
         if (scope.mode === "shared") yield* requireInsideProject(scope.projectRoot!, target);
         const current = yield* readTextIfExists(target);
         yield* checkRevision(target, current, input.expectedRevision);
-        yield* ensureDir(path.dirname(target));
-        yield* writeText(target, input.content);
-        yield* ensureProjectState(scope);
+        yield* writeTextJournaled(target, input.content, journal);
+        yield* ensureProjectState(scope, journal);
         return {
           path: target,
           revision: revisionOf(input.content),
@@ -1311,106 +1533,103 @@ const make = Effect.gen(function* () {
     );
 
   const importSkill: SkillLibrary["Service"]["importSkill"] = (input) =>
-    locked(
-      transact((journal) =>
-        Effect.gen(function* () {
-          const scope = yield* resolveScope(input.scope);
-          if (input.adoptOriginal && scope.kind !== "global") {
-            return yield* skillsError(
-              "unsupported",
-              "Only global imports can replace the original. Project imports never touch it.",
-            );
-          }
-          const snapshot = yield* buildSnapshot(scope);
-          let entry = snapshot.entries.find((candidate) => candidate.id === input.entryId);
-          if (entry === undefined && scope.kind === "project") {
-            const globalSnapshot = yield* buildSnapshot(globalScope);
-            entry = globalSnapshot.entries.find((candidate) => candidate.id === input.entryId);
-          }
-          if (entry === undefined) {
-            return yield* skillsError("notFound", "The skill to import is no longer listed.");
-          }
-          const source = entry;
-          const name = Option.getOrUndefined(decodeSkillName(input.name ?? source.name));
-          if (name === undefined) {
-            return yield* skillsError(
-              "invalidName",
-              "This skill's folder name cannot be used in the library. Choose a name.",
-            );
-          }
-          if (input.adoptOriginal && source.ownership !== "unmanaged") {
-            return yield* skillsError(
-              "readOnly",
-              "Only unmanaged skills can be adopted. Provider-installed skills stay where they are.",
-              { path: source.path },
-            );
-          }
-          const destination = path.join(scope.libraryDir, name);
-          if (scope.mode === "shared") yield* requireInsideProject(scope.projectRoot!, destination);
-          const occupied: Array<string> = [];
-          for (const candidate of [
-            destination,
-            scope.disabledDir && path.join(scope.disabledDir, name),
-          ]) {
-            if (candidate && (yield* pathState(candidate)).kind !== "missing")
-              occupied.push(candidate);
-          }
-          if (occupied.length > 0) {
-            return yield* skillsError("conflict", "A skill with this name already exists.", {
-              conflictPaths: occupied,
-            });
-          }
-
-          const staging = path.join(stagingDir, NodeCrypto.randomBytes(8).toString("hex"));
-          yield* ensureDir(staging);
-          yield* Effect.gen(function* () {
-            yield* fileSystem
-              .copy(source.path, path.join(staging, name))
-              .pipe(Effect.mapError(fsError("Could not copy the skill.", source.path)));
-            yield* ensureDir(scope.libraryDir);
-            yield* movePath(path.join(staging, name), destination);
-            journal.push(fileSystem.remove(destination, { recursive: true }));
-          }).pipe(
-            Effect.ensuring(fileSystem.remove(staging, { recursive: true }).pipe(Effect.ignore)),
+    mutate(input.scope, (scope, journal) =>
+      Effect.gen(function* () {
+        if (input.adoptOriginal && scope.kind !== "global") {
+          return yield* skillsError(
+            "unsupported",
+            "Only global imports can replace the original. Project imports never touch it.",
           );
+        }
+        const snapshot = yield* buildSnapshot(scope);
+        let entry = snapshot.entries.find((candidate) => candidate.id === input.entryId);
+        if (entry === undefined && scope.kind === "project") {
+          const globalSnapshot = yield* buildSnapshot(globalScope);
+          entry = globalSnapshot.entries.find((candidate) => candidate.id === input.entryId);
+        }
+        if (entry === undefined) {
+          return yield* skillsError("notFound", "The skill to import is no longer listed.");
+        }
+        const source = entry;
+        const name = Option.getOrUndefined(decodeSkillName(input.name ?? source.name));
+        if (name === undefined) {
+          return yield* skillsError(
+            "invalidName",
+            "This skill's folder name cannot be used in the library. Choose a name.",
+          );
+        }
+        if (input.adoptOriginal && source.ownership !== "unmanaged") {
+          return yield* skillsError(
+            "readOnly",
+            "Only unmanaged skills can be adopted. Provider-installed skills stay where they are.",
+            { path: source.path },
+          );
+        }
+        const destination = path.join(scope.libraryDir, name);
+        if (scope.mode === "shared") yield* requireInsideProject(scope.projectRoot!, destination);
+        const occupied: Array<string> = [];
+        for (const candidate of [
+          destination,
+          scope.disabledDir && path.join(scope.disabledDir, name),
+        ]) {
+          if (candidate && (yield* pathState(candidate)).kind !== "missing")
+            occupied.push(candidate);
+        }
+        if (occupied.length > 0) {
+          return yield* skillsError("conflict", "A skill with this name already exists.", {
+            conflictPaths: occupied,
+          });
+        }
 
-          const recovery: Array<RecoveryRecord> = [];
-          if (input.adoptOriginal) {
-            // Physical folders first: links that pointed at them then reach the
-            // library through the new link and can stay as the user made them.
-            const ordered = [
-              ...source.origins.filter((origin) => origin.symlinkTarget === undefined),
-              ...source.origins.filter((origin) => origin.symlinkTarget !== undefined),
-            ];
-            const destinationReal = yield* realOrResolved(destination);
-            const installedLinkTarget = yield* canonicalForm(destination);
-            for (const origin of ordered) {
-              // Already reaching the copy, possibly through a link made a moment ago
-              // when two provider folders are the same folder.
-              if ((yield* realOrResolved(origin.entryPath)) === destinationReal) continue;
-              recovery.push(
-                yield* moveToRecovery(
-                  {
-                    kind: "replacedOriginal",
-                    name,
-                    sourcePath: origin.entryPath,
-                    installedLinkTarget,
-                  },
-                  journal,
-                ),
-              );
-              yield* createLink(destination, origin.entryPath, journal);
-            }
+        const staging = path.join(stagingDir, NodeCrypto.randomBytes(8).toString("hex"));
+        yield* ensureDir(staging);
+        yield* Effect.gen(function* () {
+          yield* fileSystem
+            .copy(source.path, path.join(staging, name))
+            .pipe(Effect.mapError(fsError("Could not copy the skill.", source.path)));
+          yield* ensureDir(scope.libraryDir);
+          yield* movePath(path.join(staging, name), destination);
+          journal.push(fileSystem.remove(destination, { recursive: true }));
+        }).pipe(
+          Effect.ensuring(fileSystem.remove(staging, { recursive: true }).pipe(Effect.ignore)),
+        );
+
+        const recovery: Array<RecoveryRecord> = [];
+        if (input.adoptOriginal) {
+          // Physical folders first: links that pointed at them then reach the
+          // library through the new link and can stay as the user made them.
+          const ordered = [
+            ...source.origins.filter((origin) => origin.symlinkTarget === undefined),
+            ...source.origins.filter((origin) => origin.symlinkTarget !== undefined),
+          ];
+          const destinationReal = yield* realOrResolved(destination);
+          const installedLinkTarget = yield* canonicalForm(destination);
+          for (const origin of ordered) {
+            // Already reaching the copy, possibly through a link made a moment ago
+            // when two provider folders are the same folder.
+            if ((yield* realOrResolved(origin.entryPath)) === destinationReal) continue;
+            recovery.push(
+              yield* moveToRecovery(
+                {
+                  kind: "replacedOriginal",
+                  name,
+                  sourcePath: origin.entryPath,
+                  installedLinkTarget,
+                },
+                journal,
+              ),
+            );
+            yield* createLink(destination, origin.entryPath, journal);
           }
-          yield* ensureProjectState(scope, journal);
-          return {
-            name,
-            path: destination,
-            recovery: recovery.map(toRecoveryEntry),
-            snapshot: yield* buildSnapshot(scope),
-          };
-        }),
-      ),
+        }
+        yield* ensureProjectState(scope, journal);
+        return {
+          name,
+          path: destination,
+          recovery: recovery.map(toRecoveryEntry),
+          snapshot: yield* buildSnapshot(scope),
+        };
+      }),
     );
 
   /** Remove T3's links to a global skill, journaling their return. */
@@ -1446,140 +1665,129 @@ const make = Effect.gen(function* () {
     });
 
   const setEnabled: SkillLibrary["Service"]["setEnabled"] = (input) =>
-    locked(
-      transact((journal) =>
-        Effect.gen(function* () {
-          const scope = yield* resolveScope(input.scope);
-          yield* requireNotShared(
-            scope,
-            "Shared mode only edits repository files. Switch a repository skill off in local mode.",
-          );
-          let name: string;
-          if ("name" in input.skill) {
-            name = input.skill.name;
-          } else {
-            const snapshot = yield* buildSnapshot(scope);
-            const entry = yield* findEntry(snapshot, scope, input.skill);
-            if (entry.ownership !== "managed") {
-              if (scope.mode !== "local" || entry.ownership !== "unmanaged") {
-                return yield* skillsError(
-                  "readOnly",
-                  "Import this skill into the library to switch it off here.",
-                  { path: entry.path },
-                );
-              }
-              const manifest = (yield* readManifest(scope))!;
-              const paths = entry.origins
-                .filter((origin) => isWithin(scope.projectRoot!, origin.entryPath))
-                .map((origin) =>
-                  path.relative(scope.projectRoot!, origin.entryPath).replaceAll("\\", "/"),
-                );
-              const disabled = new Set(manifest.disabledRepoSkills);
-              for (const relative of paths) {
-                if (input.enabled) disabled.delete(relative);
-                else disabled.add(relative);
-              }
-              yield* writeManifest(
-                scope,
-                { ...manifest, disabledRepoSkills: [...disabled].toSorted() },
-                journal,
-              );
-              return { skippedLinks: [], snapshot: yield* buildSnapshot(scope) };
-            }
-            name = entry.name;
-          }
-
-          const enabledPath = path.join(scope.libraryDir, name);
-          const disabledPath = path.join(scope.disabledDir!, name);
-          const [from, to] = input.enabled
-            ? [disabledPath, enabledPath]
-            : [enabledPath, disabledPath];
-          const fromState = yield* pathState(from);
-          const toState = yield* pathState(to);
-          if (fromState.kind === "missing") {
-            if (toState.kind === "directory") {
-              return { skippedLinks: [], snapshot: yield* buildSnapshot(scope) };
-            }
-            return yield* skillsError("notFound", "The library skill does not exist.", {
-              path: from,
-            });
-          }
-          if (toState.kind !== "missing") {
-            return yield* skillsError("conflict", "Both an enabled and a disabled copy exist.", {
-              conflictPaths: [to],
-            });
-          }
-
-          let skippedLinks: Array<string> = [];
-          yield* ensureDir(path.dirname(to));
-          if (scope.kind === "global") {
-            const state = yield* readLibraryState;
-            if (input.enabled) {
-              yield* movePath(from, to);
-              journal.push(movePath(to, from));
-              skippedLinks = yield* restoreLinks(name, state.disabledLinks[name] ?? [], journal);
-              const { [name]: _restored, ...remaining } = state.disabledLinks;
-              yield* writeLibraryState({ ...state, disabledLinks: remaining }, journal);
-            } else {
-              const removed = yield* removeOwnedLinks(name, journal);
-              yield* movePath(from, to);
-              journal.push(movePath(to, from));
-              yield* writeLibraryState(
-                { ...state, disabledLinks: { ...state.disabledLinks, [name]: removed } },
-                journal,
+    mutate(input.scope, (scope, journal) =>
+      Effect.gen(function* () {
+        yield* requireNotShared(
+          scope,
+          "Shared mode only edits repository files. Switch a repository skill off in local mode.",
+        );
+        let name: string;
+        if ("name" in input.skill) {
+          name = input.skill.name;
+        } else {
+          const snapshot = yield* buildSnapshot(scope);
+          const entry = yield* findEntry(snapshot, scope, input.skill);
+          if (entry.ownership !== "managed") {
+            if (scope.mode !== "local" || entry.ownership !== "unmanaged") {
+              return yield* skillsError(
+                "readOnly",
+                "Import this skill into the library to switch it off here.",
+                { path: entry.path },
               );
             }
-          } else {
+            const manifest = (yield* readManifest(scope))!;
+            const disabled = new Set(manifest.disabledRepoSkills);
+            for (const relative of repositoryPaths(scope, entry.origins)) {
+              if (input.enabled) disabled.delete(relative);
+              else disabled.add(relative);
+            }
+            yield* writeManifest(
+              scope,
+              { ...manifest, disabledRepoSkills: [...disabled].toSorted() },
+              journal,
+            );
+            return { skippedLinks: [], snapshot: yield* buildSnapshot(scope) };
+          }
+          name = entry.name;
+        }
+
+        const enabledPath = path.join(scope.libraryDir, name);
+        const disabledPath = path.join(scope.disabledDir!, name);
+        const [from, to] = input.enabled
+          ? [disabledPath, enabledPath]
+          : [enabledPath, disabledPath];
+        const fromState = yield* pathState(from);
+        const toState = yield* pathState(to);
+        if (fromState.kind === "missing") {
+          if (toState.kind === "directory") {
+            return { skippedLinks: [], snapshot: yield* buildSnapshot(scope) };
+          }
+          return yield* skillsError("notFound", "The library skill does not exist.", {
+            path: from,
+          });
+        }
+        if (toState.kind !== "missing") {
+          return yield* skillsError("conflict", "Both an enabled and a disabled copy exist.", {
+            conflictPaths: [to],
+          });
+        }
+
+        let skippedLinks: Array<string> = [];
+        yield* ensureDir(path.dirname(to));
+        if (scope.kind === "global") {
+          const state = yield* readLibraryState;
+          if (input.enabled) {
             yield* movePath(from, to);
             journal.push(movePath(to, from));
+            skippedLinks = yield* restoreLinks(name, state.disabledLinks[name] ?? [], journal);
+            const { [name]: _restored, ...remaining } = state.disabledLinks;
+            yield* writeLibraryState({ ...state, disabledLinks: remaining }, journal);
+          } else {
+            const removed = yield* removeOwnedLinks(name, journal);
+            yield* movePath(from, to);
+            journal.push(movePath(to, from));
+            yield* writeLibraryState(
+              { ...state, disabledLinks: { ...state.disabledLinks, [name]: removed } },
+              journal,
+            );
           }
-          return { skippedLinks, snapshot: yield* buildSnapshot(scope) };
-        }),
-      ),
+        } else {
+          yield* movePath(from, to);
+          journal.push(movePath(to, from));
+        }
+        return { skippedLinks, snapshot: yield* buildSnapshot(scope) };
+      }),
     );
 
   const archive: SkillLibrary["Service"]["archive"] = (input) =>
-    locked(
-      transact((journal) =>
-        Effect.gen(function* () {
-          const scope = yield* resolveScope(input.scope);
-          yield* requireNotShared(
-            scope,
-            "Remove repository skills with version control. Shared mode never deletes them.",
-          );
-          const enabledPath = path.join(scope.libraryDir, input.name);
-          const wasEnabled = (yield* pathState(enabledPath)).kind === "directory";
-          const sourcePath = wasEnabled ? enabledPath : path.join(scope.disabledDir!, input.name);
-          if (!wasEnabled && (yield* pathState(sourcePath)).kind !== "directory") {
-            return yield* skillsError("notFound", "The library skill does not exist.", {
-              path: enabledPath,
-            });
+    mutate(input.scope, (scope, journal) =>
+      Effect.gen(function* () {
+        yield* requireNotShared(
+          scope,
+          "Remove repository skills with version control. Shared mode never deletes them.",
+        );
+        const enabledPath = path.join(scope.libraryDir, input.name);
+        const wasEnabled = (yield* pathState(enabledPath)).kind === "directory";
+        const sourcePath = wasEnabled ? enabledPath : path.join(scope.disabledDir!, input.name);
+        if (!wasEnabled && (yield* pathState(sourcePath)).kind !== "directory") {
+          return yield* skillsError("notFound", "The library skill does not exist.", {
+            path: enabledPath,
+          });
+        }
+        let linkPaths: ReadonlyArray<string> = [];
+        if (scope.kind === "global") {
+          const state = yield* readLibraryState;
+          linkPaths = wasEnabled
+            ? yield* removeOwnedLinks(input.name, journal)
+            : (state.disabledLinks[input.name] ?? []);
+          if (!wasEnabled) {
+            const { [input.name]: _archived, ...remaining } = state.disabledLinks;
+            yield* writeLibraryState({ ...state, disabledLinks: remaining }, journal);
           }
-          let linkPaths: ReadonlyArray<string> = [];
-          if (scope.kind === "global") {
-            const state = yield* readLibraryState;
-            linkPaths = wasEnabled
-              ? yield* removeOwnedLinks(input.name, journal)
-              : (state.disabledLinks[input.name] ?? []);
-            if (!wasEnabled) {
-              const { [input.name]: _archived, ...remaining } = state.disabledLinks;
-              yield* writeLibraryState({ ...state, disabledLinks: remaining }, journal);
-            }
-          }
-          const record = yield* moveToRecovery(
-            {
-              kind: "archivedSkill",
-              name: input.name,
-              sourcePath,
-              projectRoot: scope.projectRoot,
-              linkPaths,
-              wasEnabled,
-            },
-            journal,
-          );
-          return { recovery: toRecoveryEntry(record), snapshot: yield* buildSnapshot(scope) };
-        }),
-      ),
+        }
+        const record = yield* moveToRecovery(
+          {
+            kind: "archivedSkill",
+            name: input.name,
+            sourcePath,
+            projectRoot: recoveryOwner(scope, "archivedSkill"),
+            linkPaths,
+            wasEnabled,
+          },
+          journal,
+        );
+        return { recovery: toRecoveryEntry(record), snapshot: yield* buildSnapshot(scope) };
+      }),
     );
 
   /**
@@ -1608,98 +1816,96 @@ const make = Effect.gen(function* () {
   const scopedRecord = (scope: ResolvedScope, recoveryId: string) =>
     readRecoveryRecord(recoveryId).pipe(
       Effect.filterOrFail(
-        (record) => record.projectRoot === scope.projectRoot,
+        (record) => record.projectRoot === recoveryOwner(scope, record.kind),
         () => skillsError("notFound", "The recovery item belongs to another scope."),
       ),
     );
 
+  const retiredDirFor = (recoveryId: string) => path.join(stagingDir, `restored-${recoveryId}`);
+
   const restore: SkillLibrary["Service"]["restore"] = (input) =>
-    locked(
+    mutate(input.scope, (scope, journal) =>
       Effect.gen(function* () {
-        const scope = yield* resolveScope(input.scope);
         const record = yield* scopedRecord(scope, input.recoveryId);
         const itemDir = path.join(recoveryDir, record.id);
-        const retiredDir = path.join(stagingDir, `restored-${record.id}`);
-        const result = yield* transact((journal) =>
-          Effect.gen(function* () {
-            const payload = path.join(itemDir, "payload");
-            let restoredPath: string;
-            let skippedLinks: Array<string> = [];
-            if (record.kind === "archivedSkill") {
-              const privateDir =
-                record.projectRoot === undefined ? undefined : privateDirFor(record.projectRoot);
-              const enabledDir = privateDir ? path.join(privateDir, "skills") : libraryDir;
-              const disabledRoot = privateDir
-                ? path.join(privateDir, "disabled-skills")
-                : disabledDir;
-              const enabledPath = path.join(enabledDir, record.name);
-              const disabledPath = path.join(disabledRoot, record.name);
-              const occupied: Array<string> = [];
-              for (const candidate of [enabledPath, disabledPath]) {
-                if ((yield* pathState(candidate)).kind !== "missing") occupied.push(candidate);
-              }
-              if (occupied.length > 0) {
-                return yield* skillsError("conflict", "A skill with this name exists again.", {
-                  conflictPaths: occupied,
-                });
-              }
-              const wasEnabled = record.wasEnabled !== false;
-              restoredPath = wasEnabled ? enabledPath : disabledPath;
-              yield* ensureDir(path.dirname(restoredPath));
-              yield* movePath(payload, restoredPath);
-              journal.push(movePath(restoredPath, payload));
-              if (privateDir === undefined) {
-                const linkPaths = record.linkPaths ?? [];
-                if (wasEnabled) {
-                  skippedLinks = yield* restoreLinks(record.name, linkPaths, journal);
-                } else if (linkPaths.length > 0) {
-                  const state = yield* readLibraryState;
-                  yield* writeLibraryState(
-                    {
-                      ...state,
-                      disabledLinks: { ...state.disabledLinks, [record.name]: linkPaths },
-                    },
-                    journal,
-                  );
-                }
-              }
-            } else {
-              restoredPath = record.originalPath;
-              const state = yield* pathState(restoredPath);
-              if (
-                state.kind === "symlink" &&
-                (yield* isRecordedLink(record, restoredPath, state.linkText))
-              ) {
-                yield* removePath(restoredPath);
-                journal.push(fileSystem.symlink(state.linkText, restoredPath));
-              } else if (state.kind !== "missing") {
-                return yield* skillsError(
-                  "conflict",
-                  "Something other than T3's link now occupies the original location.",
-                  { conflictPaths: [restoredPath] },
-                );
-              }
-              yield* ensureDir(path.dirname(restoredPath));
-              yield* movePath(payload, restoredPath);
-              journal.push(movePath(restoredPath, payload));
+        const retiredDir = retiredDirFor(record.id);
+        const payload = path.join(itemDir, "payload");
+        let restoredPath: string;
+        let skippedLinks: Array<string> = [];
+        if (record.kind === "archivedSkill") {
+          const privateDir =
+            record.projectRoot === undefined ? undefined : privateDirFor(record.projectRoot);
+          const enabledDir = privateDir ? path.join(privateDir, "skills") : libraryDir;
+          const disabledRoot = privateDir ? path.join(privateDir, "disabled-skills") : disabledDir;
+          const enabledPath = path.join(enabledDir, record.name);
+          const disabledPath = path.join(disabledRoot, record.name);
+          const occupied: Array<string> = [];
+          for (const candidate of [enabledPath, disabledPath]) {
+            if ((yield* pathState(candidate)).kind !== "missing") occupied.push(candidate);
+          }
+          if (occupied.length > 0) {
+            return yield* skillsError("conflict", "A skill with this name exists again.", {
+              conflictPaths: occupied,
+            });
+          }
+          const wasEnabled = record.wasEnabled !== false;
+          restoredPath = wasEnabled ? enabledPath : disabledPath;
+          yield* ensureDir(path.dirname(restoredPath));
+          yield* movePath(payload, restoredPath);
+          journal.push(movePath(restoredPath, payload));
+          if (privateDir === undefined) {
+            const linkPaths = record.linkPaths ?? [];
+            if (wasEnabled) {
+              skippedLinks = yield* restoreLinks(record.name, linkPaths, journal);
+            } else if (linkPaths.length > 0) {
+              const state = yield* readLibraryState;
+              yield* writeLibraryState(
+                {
+                  ...state,
+                  disabledLinks: { ...state.disabledLinks, [record.name]: linkPaths },
+                },
+                journal,
+              );
             }
-            // Retire the item by moving it aside, so a rollback can put it back
-            // whole. It is deleted only once everything else has succeeded.
-            yield* ensureDir(stagingDir);
-            yield* movePath(itemDir, retiredDir);
-            journal.push(movePath(retiredDir, itemDir));
-            return { restoredPath, skippedLinks, snapshot: yield* buildSnapshot(scope) };
-          }),
-        );
-        yield* fileSystem
-          .remove(retiredDir, { recursive: true })
+          }
+        } else {
+          restoredPath = record.originalPath;
+          const state = yield* pathState(restoredPath);
+          if (
+            state.kind === "symlink" &&
+            (yield* isRecordedLink(record, restoredPath, state.linkText))
+          ) {
+            yield* removePath(restoredPath);
+            journal.push(fileSystem.symlink(state.linkText, restoredPath));
+          } else if (state.kind !== "missing") {
+            return yield* skillsError(
+              "conflict",
+              "Something other than T3's link now occupies the original location.",
+              { conflictPaths: [restoredPath] },
+            );
+          }
+          yield* ensureDir(path.dirname(restoredPath));
+          yield* movePath(payload, restoredPath);
+          journal.push(movePath(restoredPath, payload));
+        }
+        // Retire the item by moving it aside, so a rollback can put it back
+        // whole. It is deleted only once everything else has succeeded.
+        yield* ensureDir(stagingDir);
+        yield* movePath(itemDir, retiredDir);
+        journal.push(movePath(retiredDir, itemDir));
+        return { restoredPath, skippedLinks, snapshot: yield* buildSnapshot(scope) };
+      }),
+    ).pipe(
+      // Only a committed restore gets here, so the id has been validated.
+      Effect.tap(() =>
+        fileSystem
+          .remove(retiredDirFor(input.recoveryId), { recursive: true })
           .pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("Could not clear a restored recovery item.", { cause }),
             ),
-          );
-        return result;
-      }),
+          ),
+      ),
     );
 
   const deleteRecovery: SkillLibrary["Service"]["deleteRecovery"] = (input) =>
@@ -1717,9 +1923,8 @@ const make = Effect.gen(function* () {
    * links are absolute. Shared links are relative, so they work in every
    * clone, and both ends must stay inside the checkout.
    */
-  const linkPlan = (input: SkillsLinkInput | SkillsUnlinkInput) =>
+  const linkPlan = (input: SkillsLinkInput | SkillsUnlinkInput, scope: ResolvedScope) =>
     Effect.gen(function* () {
-      const scope = yield* resolveScope(input.scope ?? {});
       if (scope.kind === "project" && scope.mode !== "shared") {
         return yield* skillsError(
           "unsupported",
@@ -1770,115 +1975,111 @@ const make = Effect.gen(function* () {
                 (yield* physicalLocation(path.dirname(linkPath))) ?? path.dirname(linkPath);
               return path.relative(parent, yield* canonicalForm(canonical));
             });
-      return { scope, canonical, linkPaths, linkText };
+      return { canonical, linkPaths, linkText };
     });
 
   const link: SkillLibrary["Service"]["link"] = (input) =>
-    locked(
-      transact((journal) =>
-        Effect.gen(function* () {
-          const plan = yield* linkPlan(input);
-          const { canonical, linkPaths, scope } = plan;
-          const canonicalState = yield* pathState(canonical);
-          if (input.subject.type === "skill" && canonicalState.kind !== "directory") {
-            if (scope.kind === "global") {
-              const disabled = yield* pathState(path.join(disabledDir, input.subject.name));
-              if (disabled.kind === "directory") {
-                return yield* skillsError("unsupported", "Enable the skill before linking it.");
-              }
+    mutate(input.scope ?? {}, (scope, journal) =>
+      Effect.gen(function* () {
+        const plan = yield* linkPlan(input, scope);
+        const { canonical, linkPaths } = plan;
+        const canonicalState = yield* pathState(canonical);
+        if (input.subject.type === "skill" && canonicalState.kind !== "directory") {
+          if (scope.kind === "global") {
+            const disabled = yield* pathState(path.join(disabledDir, input.subject.name));
+            if (disabled.kind === "directory") {
+              return yield* skillsError("unsupported", "Enable the skill before linking it.");
             }
-            return yield* skillsError(
-              "notFound",
-              canonicalState.kind === "symlink"
-                ? "Only skills stored directly in the library folder can be linked."
-                : "The library skill does not exist.",
-              { path: canonical },
+          }
+          return yield* skillsError(
+            "notFound",
+            canonicalState.kind === "symlink"
+              ? "Only skills stored directly in the library folder can be linked."
+              : "The library skill does not exist.",
+            { path: canonical },
+          );
+        }
+        if (input.subject.type === "instructions" && canonicalState.kind !== "file") {
+          return yield* skillsError("notFound", "Save the instructions before linking them.", {
+            path: canonical,
+          });
+        }
+        const occupied: Array<string> = [];
+        const pending: Array<string> = [];
+        for (const linkPath of linkPaths) {
+          const state = yield* classifyLink(linkPath, canonical);
+          if (state.kind === "missing") pending.push(linkPath);
+          else if (state.kind === "occupied") {
+            occupied.push(linkPath);
+            pending.push(linkPath);
+          }
+        }
+        if (occupied.length > 0 && !input.replace) {
+          return yield* skillsError(
+            "conflict",
+            "Something already exists where the link would go. Pass replace to move it to recovery.",
+            { conflictPaths: occupied },
+          );
+        }
+        const name = input.subject.type === "skill" ? input.subject.name : "instructions";
+        const installedLinkTarget = yield* canonicalForm(canonical);
+        const recovery: Array<RecoveryRecord> = [];
+        for (const linkPath of pending) {
+          if (occupied.includes(linkPath)) {
+            recovery.push(
+              yield* moveToRecovery(
+                {
+                  kind: "replacedOriginal",
+                  name,
+                  sourcePath: linkPath,
+                  projectRoot: scope.projectRoot,
+                  installedLinkTarget,
+                },
+                journal,
+              ),
             );
           }
-          if (input.subject.type === "instructions" && canonicalState.kind !== "file") {
-            return yield* skillsError("notFound", "Save the instructions before linking them.", {
-              path: canonical,
-            });
-          }
-          const occupied: Array<string> = [];
-          const pending: Array<string> = [];
-          for (const linkPath of linkPaths) {
-            const state = yield* classifyLink(linkPath, canonical);
-            if (state.kind === "missing") pending.push(linkPath);
-            else if (state.kind === "occupied") {
-              occupied.push(linkPath);
-              pending.push(linkPath);
-            }
-          }
-          if (occupied.length > 0 && !input.replace) {
-            return yield* skillsError(
-              "conflict",
-              "Something already exists where the link would go. Pass replace to move it to recovery.",
-              { conflictPaths: occupied },
-            );
-          }
-          const name = input.subject.type === "skill" ? input.subject.name : "instructions";
-          const installedLinkTarget = yield* canonicalForm(canonical);
-          const recovery: Array<RecoveryRecord> = [];
-          for (const linkPath of pending) {
-            if (occupied.includes(linkPath)) {
-              recovery.push(
-                yield* moveToRecovery(
-                  {
-                    kind: "replacedOriginal",
-                    name,
-                    sourcePath: linkPath,
-                    projectRoot: scope.projectRoot,
-                    installedLinkTarget,
-                  },
-                  journal,
-                ),
-              );
-            }
-            yield* createLink(yield* plan.linkText(linkPath), linkPath, journal);
-          }
-          return {
-            linked: linkPaths,
-            recovery: recovery.map(toRecoveryEntry),
-            snapshot: yield* buildSnapshot(scope),
-          };
-        }),
-      ),
+          yield* createLink(yield* plan.linkText(linkPath), linkPath, journal);
+        }
+        return {
+          linked: linkPaths,
+          recovery: recovery.map(toRecoveryEntry),
+          snapshot: yield* buildSnapshot(scope),
+        };
+      }),
     );
 
   const unlink: SkillLibrary["Service"]["unlink"] = (input) =>
-    locked(
-      transact((journal) =>
-        Effect.gen(function* () {
-          const { canonical, linkPaths, scope } = yield* linkPlan(input);
-          const removed: Array<string> = [];
-          for (const linkPath of linkPaths) {
-            const state = yield* pathState(linkPath);
-            if (state.kind !== "symlink" || !(yield* isOwnedLink(linkPath, canonical))) continue;
-            yield* removePath(linkPath);
-            journal.push(fileSystem.symlink(state.linkText, linkPath));
-            removed.push(linkPath);
-          }
-          // A disabled skill remembers links to restore; forget the unlinked ones.
-          if (scope.kind === "global" && input.subject.type === "skill") {
-            const state = yield* readLibraryState;
-            const remembered = state.disabledLinks[input.subject.name];
-            if (remembered !== undefined) {
-              yield* writeLibraryState(
-                {
-                  ...state,
-                  disabledLinks: {
-                    ...state.disabledLinks,
-                    [input.subject.name]: remembered.filter((entry) => !linkPaths.includes(entry)),
-                  },
+    mutate(input.scope ?? {}, (scope, journal) =>
+      Effect.gen(function* () {
+        const { canonical, linkPaths } = yield* linkPlan(input, scope);
+        const removed: Array<string> = [];
+        for (const linkPath of linkPaths) {
+          const state = yield* pathState(linkPath);
+          if (state.kind !== "symlink" || !(yield* isOwnedLink(linkPath, canonical))) continue;
+          yield* removePath(linkPath);
+          journal.push(fileSystem.symlink(state.linkText, linkPath));
+          removed.push(linkPath);
+        }
+        // A disabled skill remembers links to restore; forget the unlinked ones.
+        if (scope.kind === "global" && input.subject.type === "skill") {
+          const state = yield* readLibraryState;
+          const remembered = state.disabledLinks[input.subject.name];
+          if (remembered !== undefined) {
+            yield* writeLibraryState(
+              {
+                ...state,
+                disabledLinks: {
+                  ...state.disabledLinks,
+                  [input.subject.name]: remembered.filter((entry) => !linkPaths.includes(entry)),
                 },
-                journal,
-              );
-            }
+              },
+              journal,
+            );
           }
-          return { removed, snapshot: yield* buildSnapshot(scope) };
-        }),
-      ),
+        }
+        return { removed, snapshot: yield* buildSnapshot(scope) };
+      }),
     );
 
   /** The canonical instruction file for a scope, checked for shared-mode escapes. */
@@ -1925,7 +2126,12 @@ const make = Effect.gen(function* () {
       return yield* instructionsDocument(scope, filePath, yield* readTextIfExists(filePath));
     });
 
-  const writeInstructions = (scope: ResolvedScope, filePath: string, content: string) =>
+  const writeInstructions = (
+    scope: ResolvedScope,
+    filePath: string,
+    content: string,
+    journal: Journal,
+  ) =>
     Effect.gen(function* () {
       // T3's own files are written in place; a shared-mode symlink such as
       // CLAUDE.md -> AGENTS.md keeps its link and updates the file it names.
@@ -1934,26 +2140,23 @@ const make = Effect.gen(function* () {
           path: filePath,
         });
       }
-      yield* ensureDir(path.dirname(filePath));
-      yield* writeText(filePath, content);
-      yield* ensureProjectState(scope);
+      yield* writeTextJournaled(filePath, content, journal);
+      yield* ensureProjectState(scope, journal);
     });
 
   const saveInstructions: SkillLibrary["Service"]["saveInstructions"] = (input) =>
-    locked(
+    mutate(input.scope, (scope, journal) =>
       Effect.gen(function* () {
-        const scope = yield* resolveScope(input.scope);
         const filePath = yield* instructionsPath(scope, input.file);
         yield* checkRevision(filePath, yield* readTextIfExists(filePath), input.expectedRevision);
-        yield* writeInstructions(scope, filePath, input.content);
+        yield* writeInstructions(scope, filePath, input.content, journal);
         return yield* instructionsDocument(scope, filePath, input.content);
       }),
     );
 
   const importInstructions: SkillLibrary["Service"]["importInstructions"] = (input) =>
-    locked(
+    mutate(input.scope, (scope, journal) =>
       Effect.gen(function* () {
-        const scope = yield* resolveScope(input.scope);
         yield* requireNotShared(scope, "Shared mode edits the repository file directly.");
         const homes = yield* loadHomes;
         const sources =
@@ -1990,13 +2193,13 @@ const make = Effect.gen(function* () {
           );
         }
         yield* checkRevision(filePath, current, input.expectedRevision ?? null);
-        yield* writeInstructions(scope, filePath, content);
+        yield* writeInstructions(scope, filePath, content, journal);
         return yield* instructionsDocument(scope, filePath, content);
       }),
     );
 
   const updateProjectSettings: SkillLibrary["Service"]["updateProjectSettings"] = (input) =>
-    locked(
+    mutate({ projectPath: input.projectPath, mode: "local" }, (scope, journal) =>
       Effect.gen(function* () {
         if (input.globalInstructionsEnabled === false) {
           return yield* skillsError(
@@ -2004,45 +2207,25 @@ const make = Effect.gen(function* () {
             "Global instructions cannot be switched off for one project yet. Providers read them from their own config, which T3 does not override per project.",
           );
         }
-        const scope = yield* resolveScope({ projectPath: input.projectPath, mode: "local" });
         const manifest = (yield* readManifest(scope))!;
-        yield* writeManifest(scope, {
-          ...manifest,
-          ...(input.instructionMode === undefined
-            ? {}
-            : { instructionMode: input.instructionMode }),
-          globalInstructionsEnabled: true,
-        });
+        yield* writeManifest(
+          scope,
+          {
+            ...manifest,
+            ...(input.instructionMode === undefined
+              ? {}
+              : { instructionMode: input.instructionMode }),
+            globalInstructionsEnabled: true,
+          },
+          journal,
+        );
         return yield* buildSnapshot(scope);
       }),
     );
 
-  /**
-   * The primary checkout of the linked Git worktree rooted at `checkoutRoot`,
-   * read from the worktree's `.git` file and the `commondir` it points to.
-   * `undefined` for primary checkouts, submodules, and bare repositories.
-   */
-  const primaryCheckoutOf = (checkoutRoot: string) =>
-    Effect.gen(function* () {
-      const dotGit = path.join(checkoutRoot, ".git");
-      if ((yield* pathState(dotGit)).kind !== "file") return undefined;
-      const pointer = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec((yield* readSmallText(dotGit)) ?? "");
-      if (!pointer?.[1]) return undefined;
-      const gitDir = path.resolve(checkoutRoot, pointer[1]);
-      const common = (yield* readSmallText(path.join(gitDir, "commondir")))?.trim();
-      if (!common) return undefined;
-      const commonDir = path.resolve(gitDir, common);
-      if (path.basename(commonDir) !== ".git") return undefined;
-      const primary = yield* realOrUndefined(path.dirname(commonDir));
-      return primary === checkoutRoot ? undefined : primary;
-    });
-
-  const overlayFor = (input: {
-    readonly activeRoot: string;
-    readonly profileRoot: string;
-    readonly manifest: ProjectManifest;
-    readonly source: "project" | "worktree";
-  }) =>
+  const overlayFor = (
+    input: ProfileLocation & { readonly manifest: ProjectManifest; readonly start: string },
+  ) =>
     Effect.gen(function* () {
       const { activeRoot, manifest } = input;
       const privateRoot = privateDirFor(input.profileRoot);
@@ -2061,7 +2244,8 @@ const make = Effect.gen(function* () {
           skills.push({ name, path: skillPath, invocationName: inspected.frontmatterName ?? name });
         }
       }
-      const disabled: Array<ProjectSkillOverlay["suppressedRepoSkills"][number]> = [];
+      type Suppression = ProjectSkillOverlay["suppressedRepoSkills"][number];
+      const disabled: Array<Suppression> = [];
       for (const relative of manifest.disabledRepoSkills.slice(0, MAX_SUPPRESSED_REPO_SKILLS)) {
         const segments = relative.split("/");
         if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
@@ -2071,9 +2255,36 @@ const make = Effect.gen(function* () {
         const inspected = yield* inspectSkillFolder(repoPath, budget);
         disabled.push({
           name: inspected?.frontmatterName ?? path.basename(repoPath),
+          folderName: path.basename(repoPath),
           path: repoPath,
           reason: "disabled",
         });
+      }
+      // Repository folders a private skill shadows, so providers that name
+      // skills by folder can switch off the right one. A profile inherited
+      // from an enclosing folder covers the working folder's skills too, as
+      // managing that folder shows them.
+      const replaced: Array<Suppression> = [];
+      if (skills.length > 0) {
+        const privateNames = new Set(skills.map((skill) => skill.invocationName));
+        const scanned = new Map<string, ScannedSkill>();
+        const roots = [...new Set([activeRoot, input.start])];
+        yield* scanSkillRoots(
+          roots.flatMap((root) => projectSkillRoots(path, root)),
+          budget,
+          scanned,
+        );
+        for (const skill of scanned.values()) {
+          if (!privateNames.has(skill.invocationName)) continue;
+          for (const origin of skill.origins) {
+            replaced.push({
+              name: skill.invocationName,
+              folderName: path.basename(origin.entryPath),
+              path: origin.entryPath,
+              reason: "replaced",
+            });
+          }
+        }
       }
       if (skills.length === 0 && disabled.length === 0 && manifest.instructionMode === "inherit") {
         return Option.none<ProjectSkillOverlay>();
@@ -2092,6 +2303,7 @@ const make = Effect.gen(function* () {
             path: null,
             reason: "replaced" as const,
           })),
+          ...replaced.toSorted((left, right) => left.path!.localeCompare(right.path!)),
         ],
         instructions: {
           mode: manifest.instructionMode,
@@ -2111,39 +2323,8 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const start = yield* realOrUndefined(cwd);
       if (start === undefined) return Option.none();
-      const ancestors = [start];
-      for (let parent = path.dirname(start); parent !== ancestors.at(-1);) {
-        ancestors.push(parent);
-        parent = path.dirname(parent);
-      }
-      for (const [index, directory] of ancestors.entries()) {
-        const manifest = yield* exactManifest(directory);
-        if (manifest !== undefined) {
-          return yield* overlayFor({
-            activeRoot: directory,
-            profileRoot: directory,
-            manifest,
-            source: "project",
-          });
-        }
-        const primary = yield* primaryCheckoutOf(directory);
-        if (primary === undefined) continue;
-        // A worktree with no profile of its own inherits the primary
-        // checkout's, matching folder for folder and deepest first.
-        for (const active of ancestors.slice(0, index + 1)) {
-          const profileRoot = path.join(primary, path.relative(directory, active));
-          const inherited = yield* exactManifest(profileRoot);
-          if (inherited !== undefined) {
-            return yield* overlayFor({
-              activeRoot: active,
-              profileRoot,
-              manifest: inherited,
-              source: "worktree",
-            });
-          }
-        }
-      }
-      return Option.none();
+      const existing = yield* existingProfile(start);
+      return existing === undefined ? Option.none() : yield* overlayFor({ ...existing, start });
     });
 
   return SkillLibrary.of({
@@ -2162,6 +2343,7 @@ const make = Effect.gen(function* () {
     importInstructions,
     updateProjectSettings,
     resolveProjectOverlay,
+    streamChanges: Stream.fromPubSub(changes),
   });
 });
 

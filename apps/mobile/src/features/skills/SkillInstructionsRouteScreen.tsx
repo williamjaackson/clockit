@@ -295,27 +295,30 @@ export function SkillInstructionsRouteScreen({
           <SkillsNote>Tap a file to import its text into these instructions.</SkillsNote>
         ) : null}
 
-        {snapshot !== null &&
-        snapshot.scope.kind === "global" &&
-        snapshot.instructions.links.length > 0 ? (
+        {snapshot !== null && !projectPrivate && snapshot.instructions.links.length > 0 ? (
           <>
-            <SettingsSection title="Provider links">
+            <SettingsSection title={shared ? "Repository links" : "Provider links"}>
               <SkillLinkRows
                 environmentId={environmentId}
+                scope={scope}
                 subject={{ type: "instructions" }}
-                subjectLabel="your instructions"
+                subjectLabel={shared ? "AGENTS.md" : "your instructions"}
                 links={snapshot.instructions.links}
-                providersFor={(targetId) =>
-                  snapshot.providers
-                    .filter((provider) => provider.instructionTargetIds.includes(targetId))
-                    .map((provider) => providerDisplayName(provider.provider))
-                    .join(", ") || targetId
-                }
+                providersFor={(targetId) => {
+                  const status = snapshot.instructions.links.find(
+                    (candidate) => candidate.targetId === targetId,
+                  );
+                  const providers =
+                    snapshot.instructions.files.find((candidate) => candidate.path === status?.path)
+                      ?.providers ?? [];
+                  return providers.map(providerDisplayName).join(", ") || targetId;
+                }}
               />
             </SettingsSection>
             <SkillsNote>
-              Link a provider's instruction file to these instructions so every provider reads the
-              same text.
+              {shared
+                ? "Claude Code reads CLAUDE.md, not AGENTS.md. Linking turns CLAUDE.md into a symlink to AGENTS.md in the repository, so both read the same file. Nothing is linked until you ask."
+                : "Link a provider's instruction file to these instructions so every provider reads the same text."}
             </SkillsNote>
           </>
         ) : null}

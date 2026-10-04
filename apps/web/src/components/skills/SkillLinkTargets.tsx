@@ -4,6 +4,7 @@ import type {
   SkillLinkSubject,
   SkillLinkTarget,
   SkillPathKind,
+  SkillScope,
 } from "@t3tools/contracts";
 import { providerDisplayName } from "@t3tools/client-runtime/state/skills";
 import { useState } from "react";
@@ -21,9 +22,14 @@ const OCCUPANT_LABEL: Record<SkillPathKind, string> = {
   symlink: "link",
 };
 
-/** Link state for one global library skill or the global instructions, per provider folder. */
+/**
+ * Link state for one subject, per target: a global library skill or the global
+ * instructions in provider folders, or in shared mode a repository skill or
+ * `AGENTS.md` in the repository's own provider paths.
+ */
 export function SkillLinkTargets(props: {
   readonly environmentId: EnvironmentId;
+  readonly scope: SkillScope;
   readonly subject: SkillLinkSubject;
   readonly subjectLabel: string;
   readonly links: ReadonlyArray<SkillLinkStatus>;
@@ -54,7 +60,7 @@ export function SkillLinkTargets(props: {
       const result = await runSkillsCommand(
         link({
           environmentId: props.environmentId,
-          input: { subject: props.subject, targetIds, replace },
+          input: { scope: props.scope, subject: props.subject, targetIds, replace },
         }),
         "Could not link",
       );
@@ -101,7 +107,11 @@ export function SkillLinkTargets(props: {
                       runSkillsCommand(
                         unlink({
                           environmentId: props.environmentId,
-                          input: { subject: props.subject, targetIds: [status.targetId] },
+                          input: {
+                            scope: props.scope,
+                            subject: props.subject,
+                            targetIds: [status.targetId],
+                          },
                         }),
                         "Could not unlink",
                       ),

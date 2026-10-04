@@ -228,6 +228,15 @@ export const ResolvedSkillScope = Schema.Struct({
   mode: Schema.optional(SkillProjectMode),
   /** The canonical (symlink-free) project root. */
   projectRoot: Schema.optional(Schema.String),
+  /**
+   * Local mode only: the folder whose private profile this scope reads and
+   * edits, the same one T3 agents in `projectRoot` use. It differs from
+   * `projectRoot` when the profile belongs to an enclosing folder, or to the
+   * primary checkout of a Git worktree (`profileSource: "worktree"`). Changes
+   * then apply everywhere that profile does.
+   */
+  profileRoot: Schema.optional(Schema.String),
+  profileSource: Schema.optional(Schema.Literals(["project", "worktree"])),
   /** Where new and imported skills go for this scope. */
   libraryPath: Schema.String,
 });

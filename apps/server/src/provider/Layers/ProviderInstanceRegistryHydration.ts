@@ -52,6 +52,7 @@ import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 
 import * as Settings from "../../serverSettings.ts";
+import type * as SkillLibrary from "../../skills/SkillLibrary.ts";
 import { BUILT_IN_DRIVERS, type BuiltInDriversEnv } from "../builtInDrivers.ts";
 import * as ProviderInstanceRegistry from "../Services/ProviderInstanceRegistry.ts";
 import * as ProviderInstanceRegistryMutator from "../Services/ProviderInstanceRegistryMutator.ts";
@@ -63,12 +64,16 @@ import {
 import * as AcpRegistrySupport from "../acp/AcpRegistrySupport.ts";
 import { AcpRegistryCatalogLive } from "./AcpRegistryCatalog.ts";
 
+// Drivers read `SkillLibrary` optionally so tests can build them without one;
+// requiring it here keeps the production runtime from dropping it, since
+// every driver is created in this layer's captured context.
 type ProviderInstanceRegistryHydrationEnv =
   | Exclude<
       BuiltInDriversEnv,
       ProviderOrchestrationAdapterInfrastructure | AcpRegistrySupport.AcpRegistryCatalog
     >
-  | Settings.ServerSettingsService;
+  | Settings.ServerSettingsService
+  | SkillLibrary.SkillLibrary;
 
 /**
  * Synthesize a `ProviderInstanceConfigMap` from a `ServerSettings` snapshot.

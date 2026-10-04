@@ -1,10 +1,18 @@
-import { ProviderDriverKind, type SkillEntry } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  SkillsError,
+  type SkillEntry,
+  type SkillsSnapshot,
+} from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   filterSkillEntries,
+  findScopeLibraryEntry,
   newSkillContent,
   skillScope,
+  skillsFailureMessage,
   skillsScopeKey,
   validateNewSkillName,
 } from "./skills.ts";
@@ -114,5 +122,74 @@ describe("skill scopes", () => {
     expect(skillsScopeKey(null, scope)).not.toBe(
       skillsScopeKey("env-1" as Parameters<typeof skillsScopeKey>[0], scope),
     );
+  });
+});
+
+describe("skillsFailureMessage", () => {
+  it("reads the skills error out of a failed scan's cause", () => {
+    const error = new SkillsError({
+      reason: "conflict",
+      detail: "Something already exists where the link would go.",
+      conflictPaths: ["/repo/CLAUDE.md"],
+    });
+    expect(skillsFailureMessage(Cause.fail(error))).toBe(
+      "Something already exists where the link would go. /repo/CLAUDE.md",
+    );
+    expect(skillsFailureMessage(Cause.die(new Error("Socket closed")))).toBe("Socket closed");
+  });
+});
+
+describe("findScopeLibraryEntry", () => {
+  const base: Omit<SkillsSnapshot, "scope" | "entries"> = {
+    linkTargets: [],
+    providers: [],
+    instructions: { canonicalPath: "/repo/AGENTS.md", canonicalExists: true, files: [], links: [] },
+    recovery: [],
+    warnings: [],
+  };
+
+  it("finds a shared skill by its folder in the repository library", () => {
+    const created = entry({
+      id: "hash",
+      name: "review",
+      scope: "project",
+      ownership: "unmanaged",
+      path: "/repo/.agents/skills/review",
+      origins: [
+        {
+          providers: [codex],
+          rootPath: "/repo/.agents/skills",
+          entryPath: "/repo/.agents/skills/review",
+          ownedLink: false,
+        },
+      ],
+    });
+    const linkedElsewhere = entry({
+      id: "other",
+      name: "review",
+      scope: "project",
+      ownership: "unmanaged",
+      path: "/repo/.claude/skills/review",
+      origins: [
+        {
+          providers: [claude],
+          rootPath: "/repo/.claude/skills",
+          entryPath: "/repo/.claude/skills/review",
+          ownedLink: false,
+        },
+      ],
+    });
+    const snapshot: SkillsSnapshot = {
+      ...base,
+      scope: {
+        kind: "project",
+        mode: "shared",
+        projectRoot: "/repo",
+        libraryPath: "/repo/.agents/skills",
+      },
+      entries: [linkedElsewhere, created],
+    };
+    expect(findScopeLibraryEntry(snapshot, "review")?.id).toBe("hash");
+    expect(findScopeLibraryEntry(snapshot, "revie")).toBeNull();
   });
 });

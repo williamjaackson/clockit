@@ -44,7 +44,10 @@ import {
   probeClaudeWorkspaceSnapshot,
 } from "../Layers/ClaudeProvider.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
-import { skillOverlayResolverFromContext } from "../ProviderSkillOverlay.ts";
+import {
+  resolveCatalogSkillOverlay,
+  skillOverlayResolverFromContext,
+} from "../ProviderSkillOverlay.ts";
 import * as ModelManifest from "../ModelManifest.ts";
 import { resolveClaudeModelCatalog } from "../ClaudeModelCatalog.ts";
 import {
@@ -356,8 +359,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         snapshotForCwd: (cwd: string) =>
           Effect.gen(function* () {
             const machineSnapshot = yield* snapshot.getSnapshot;
-            const skillOverlay =
-              resolveSkillOverlay === undefined ? undefined : yield* resolveSkillOverlay(cwd);
+            const skillOverlay = yield* resolveCatalogSkillOverlay(resolveSkillOverlay, cwd, {
+              driver: DRIVER_KIND,
+              instanceId,
+            });
             return yield* probeClaudeWorkspaceSnapshot(
               effectiveConfig,
               machineSnapshot,

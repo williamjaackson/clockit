@@ -304,24 +304,26 @@ export function SkillsInstructions(props: {
         </section>
       ) : null}
 
-      {snapshot.scope.kind === "global" && snapshot.instructions.links.length > 0 ? (
+      {!projectPrivate && snapshot.instructions.links.length > 0 ? (
         <section className="flex flex-col gap-2">
-          <h3 className="text-sm font-medium">Provider links</h3>
+          <h3 className="text-sm font-medium">{shared ? "Repository links" : "Provider links"}</h3>
           <p className="text-xs text-muted-foreground">
-            Link a provider's instruction file to these instructions so every provider reads the
-            same text.
+            {shared
+              ? "Claude Code reads CLAUDE.md, not AGENTS.md. Linking turns CLAUDE.md into a symlink to AGENTS.md in the repository, so both read the same file. Nothing is linked until you ask."
+              : "Link a provider's instruction file to these instructions so every provider reads the same text."}
           </p>
           <SkillLinkTargets
             environmentId={environmentId}
+            scope={scope}
             subject={{ type: "instructions" }}
-            subjectLabel="your instructions"
+            subjectLabel={shared ? "AGENTS.md" : "your instructions"}
             links={snapshot.instructions.links}
             linkTargets={snapshot.instructions.links.map((status) => ({
               id: status.targetId,
               path: status.path,
-              providers: snapshot.providers
-                .filter((provider) => provider.instructionTargetIds.includes(status.targetId))
-                .map((provider) => provider.provider),
+              providers:
+                snapshot.instructions.files.find((candidate) => candidate.path === status.path)
+                  ?.providers ?? [],
             }))}
           />
         </section>

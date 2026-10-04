@@ -1,8 +1,14 @@
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
-import type { EnvironmentId, OrchestrationProjectShell, SkillEntry } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  OrchestrationProjectShell,
+  SkillEntry,
+  SkillsSnapshot,
+} from "@t3tools/contracts";
 import {
   EMPTY_SKILLS_VIEW_ATOM,
   filterSkillEntries,
+  findScopeLibraryEntry,
   GLOBAL_SKILLS_SCOPE,
   PRIVATE_PROJECT_SUPPORT_NOTICE,
   skillScope,
@@ -14,7 +20,7 @@ import {
 import { useBlocker } from "@tanstack/react-router";
 import { Atom } from "effect/unstable/reactivity";
 import { PlusIcon } from "lucide-react";
-import { useCallback, useContext, useMemo, useRef, useState } from "react";
+import { useCallback, useContext, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { isElectron } from "../../env";
 import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environments";
@@ -56,19 +62,58 @@ export function SkillsPage() {
   const { environments } = useEnvironments();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const [chosenEnvironmentId, setChosenEnvironmentId] = useState<EnvironmentId | null>(null);
-  const environment =
+  const [projectPath, setProjectPath] = useState<string | null>(null);
+
+  const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
+  const onDirtyChange = useCallback((next: boolean) => {
+    dirtyRef.current = next;
+    setDirty(next);
+  }, []);
+  // Part of every editor's key. Bumping it drops the draft and reads the file again.
+  const [editorEpoch, setEditorEpoch] = useState(0);
+
+  // An unsaved draft pins the environment, project, and skill it belongs to,
+  // even if they disappear, so the draft is never dropped without asking.
+  const [pinned, setPinned] = useState<{
+    readonly key: string;
+    readonly environment: (typeof environments)[number];
+    readonly project: OrchestrationProjectShell | null;
+    readonly entry: SkillEntry | null;
+  } | null>(null);
+  const held = dirty ? pinned : null;
+  const resolvedEnvironment =
     environments.find((candidate) => candidate.environmentId === chosenEnvironmentId) ??
     environments.find((candidate) => candidate.environmentId === primaryEnvironmentId) ??
     environments[0] ??
     null;
+  const environment =
+    held !== null && held.environment.environmentId !== resolvedEnvironment?.environmentId
+      ? (environments.find(
+          (candidate) => candidate.environmentId === held.environment.environmentId,
+        ) ?? held.environment)
+      : resolvedEnvironment;
   const environmentId = environment?.environmentId ?? null;
+  const environmentGone =
+    environment !== null &&
+    !environments.some((candidate) => candidate.environmentId === environment.environmentId);
   const projects = useAtomValue(
     environmentId === null
       ? EMPTY_PROJECTS_ATOM
       : environmentProjects.environmentProjectsAtom(environmentId),
   );
-  const [projectPath, setProjectPath] = useState<string | null>(null);
-  const project = projects.find((candidate) => candidate.workspaceRoot === projectPath) ?? null;
+  const resolvedProject =
+    projects.find((candidate) => candidate.workspaceRoot === projectPath) ?? null;
+  const project =
+    held !== null &&
+    held.environment.environmentId === environmentId &&
+    held.project?.workspaceRoot !== resolvedProject?.workspaceRoot
+      ? held.project
+      : resolvedProject;
+  const projectGone =
+    project !== null &&
+    !projects.some((candidate) => candidate.workspaceRoot === project.workspaceRoot);
+
   const [sharedModeState, setSharedModeState] = useState(readSharedModeState);
   const projectModeKey =
     environmentId !== null && project !== null
@@ -86,6 +131,10 @@ export function SkillsPage() {
   );
   const scope = useMemo(() => skillScope(selection), [selection]);
   const scopeKey = skillsScopeKey(environmentId, selection);
+  const scopeKeyRef = useRef(scopeKey);
+  useLayoutEffect(() => {
+    scopeKeyRef.current = scopeKey;
+  }, [scopeKey]);
   const view = useAtomValue(
     environmentId === null
       ? EMPTY_SKILLS_VIEW_ATOM
@@ -100,12 +149,22 @@ export function SkillsPage() {
   const [newSkillOpen, setNewSkillOpen] = useState(false);
   const [importEntry, setImportEntry] = useState<SkillEntry | null>(null);
 
-  const [dirty, setDirty] = useState(false);
-  const dirtyRef = useRef(false);
-  const onDirtyChange = useCallback((next: boolean) => {
-    dirtyRef.current = next;
-    setDirty(next);
-  }, []);
+  const liveEntry = snapshot?.entries.find((entry) => entry.id === selectedEntryId) ?? null;
+  const selectedEntry =
+    liveEntry ?? (held?.entry?.id === selectedEntryId ? (held?.entry ?? null) : null);
+  const entryGone = selectedEntry !== null && liveEntry === null;
+  const pinKey =
+    dirty && environment !== null
+      ? JSON.stringify([environment.environmentId, project?.workspaceRoot, selectedEntry?.id])
+      : null;
+  if (pinKey !== (pinned?.key ?? null)) {
+    setPinned(
+      pinKey === null || environment === null
+        ? null
+        : { key: pinKey, environment, project, entry: selectedEntry },
+    );
+  }
+
   const confirmDiscard = useCallback(
     async () =>
       !dirtyRef.current ||
@@ -121,8 +180,17 @@ export function SkillsPage() {
     disabled: !dirty,
   });
 
+  /** Asks before dropping a draft, then drops it for real by remounting the editor. */
+  const discardDraft = async () => {
+    if (!(await confirmDiscard())) return false;
+    if (dirtyRef.current) {
+      onDirtyChange(false);
+      setEditorEpoch((epoch) => epoch + 1);
+    }
+    return true;
+  };
   const guarded = (apply: () => void) => async () => {
-    if (await confirmDiscard()) apply();
+    if (await discardDraft()) apply();
   };
 
   const changeEnvironment = (next: EnvironmentId) =>
@@ -140,36 +208,42 @@ export function SkillsPage() {
 
   const changeShared = async (nextShared: boolean) => {
     if (project === null || projectModeKey === null || nextShared === shared) return;
-    if (!(await confirmDiscard())) return;
     if (nextShared && !sharedModeState.confirmed.has(projectModeKey)) {
       const confirmed = await confirmSkillsAction(
         `Edit repository files for ${project.title}?\nChanges write skills, AGENTS.md, and CLAUDE.md inside ${project.workspaceRoot}. Terminal agents and teammates see them once they are committed.`,
       );
       if (!confirmed) return;
     }
+    if (!(await discardDraft())) return;
     setSharedModeState(saveSharedMode(sharedModeState, projectModeKey, nextShared));
     setSelectedEntryId(null);
   };
 
+  /** Rescans the scope and reads the open file again. */
   const refresh = () => {
     if (environmentId === null) return;
-    void guarded(() => skillsEnvironment.refresh(registry, { environmentId, scope }))();
+    void guarded(() => {
+      setEditorEpoch((epoch) => epoch + 1);
+      skillsEnvironment.refresh(registry, { environmentId, scope });
+    })();
   };
 
   const visibleEntries = useMemo(
     () => (snapshot === null ? [] : filterSkillEntries(snapshot.entries, { query, filter })),
     [filter, query, snapshot],
   );
-  const selectedEntry = snapshot?.entries.find((entry) => entry.id === selectedEntryId) ?? null;
   const selectEntry = (entryId: string) => {
     if (entryId === selectedEntryId) return;
     void guarded(() => setSelectedEntryId(entryId))();
   };
-  const selectByName = (next: typeof snapshot, name: string) => {
-    const created = next?.entries.find(
-      (entry) => entry.ownership === "managed" && entry.name === name,
-    );
-    if (created) setSelectedEntryId(created.id);
+  /**
+   * Opens a skill a dialog just wrote, unless the page has since moved to
+   * another environment or scope. `targetKey` is the scope the dialog wrote to.
+   */
+  const openWrittenSkill = (targetKey: string) => (next: SkillsSnapshot, name: string) => {
+    if (targetKey !== scopeKeyRef.current) return;
+    const written = findScopeLibraryEntry(next, name);
+    if (written !== null) selectEntry(written.id);
   };
 
   const connected = environment?.connection.phase === "connected";
@@ -347,6 +421,19 @@ export function SkillsPage() {
           </section>
         ) : null}
 
+        {environmentGone || projectGone ? (
+          <Alert variant="warning">
+            <AlertTitle>
+              {environmentGone
+                ? `${environment.label} is no longer available`
+                : `${project?.title ?? "This project"} is no longer in ${environment.label}`}
+            </AlertTitle>
+            <AlertDescription>
+              Your unsaved edits are still here, but saving will probably fail. Copy anything you
+              want to keep.
+            </AlertDescription>
+          </Alert>
+        ) : null}
         {view.error !== null ? (
           <Alert variant="error">
             <AlertDescription>
@@ -420,10 +507,19 @@ export function SkillsPage() {
               )}
               <SkillsProviders snapshot={snapshot} />
             </div>
-            <div className="min-w-0">
+            <div className="flex min-w-0 flex-col gap-4">
+              {entryGone ? (
+                <Alert variant="warning">
+                  <AlertTitle>This skill is no longer listed</AlertTitle>
+                  <AlertDescription>
+                    It was moved or removed outside this page. Your unsaved edits are still here.
+                    Copy anything you want to keep.
+                  </AlertDescription>
+                </Alert>
+              ) : null}
               {selectedEntry !== null ? (
                 <SkillDetail
-                  key={`${scopeKey}:${selectedEntry.id}`}
+                  key={`${scopeKey}:${selectedEntry.id}:${editorEpoch}`}
                   environmentId={environmentId}
                   scope={scope}
                   snapshot={snapshot}
@@ -442,7 +538,7 @@ export function SkillsPage() {
           </section>
         ) : tab === "instructions" ? (
           <SkillsInstructions
-            key={scopeKey}
+            key={`${scopeKey}:${editorEpoch}`}
             environmentId={environmentId}
             scope={scope}
             snapshot={snapshot}
@@ -459,7 +555,7 @@ export function SkillsPage() {
           environmentId={environmentId}
           scope={scope}
           snapshot={snapshot}
-          onCreated={selectByName}
+          onCreated={openWrittenSkill(scopeKey)}
         />
         {importEntry !== null ? (
           <ImportSkillDialog
@@ -471,7 +567,7 @@ export function SkillsPage() {
             environmentId={environmentId}
             scope={scope}
             snapshot={snapshot}
-            onImported={selectByName}
+            onImported={openWrittenSkill(scopeKey)}
           />
         ) : null}
       </>

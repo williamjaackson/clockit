@@ -66,6 +66,15 @@ export function SkillDetail(props: {
   const [pending, setPending] = useState(false);
   const loadIdRef = useRef(0);
   const entryId = entry.id;
+  const editorDirtyRef = useRef(false);
+  const { onDirtyChange } = props;
+  const trackDirty = useCallback(
+    (dirty: boolean) => {
+      editorDirtyRef.current = dirty;
+      onDirtyChange(dirty);
+    },
+    [onDirtyChange],
+  );
 
   const load = useCallback(
     async (nextFile: string) => {
@@ -118,13 +127,19 @@ export function SkillDetail(props: {
       : { _tag: "failed", message: skillsFailureMessage(error) };
   };
 
+  // Enabling or disabling moves a library skill's folder, so an open draft is
+  // dropped first and the file read again from its new place afterwards.
   const toggleEnabled = async (enabled: boolean) => {
+    const discarding = editorDirtyRef.current;
+    if (!(await props.confirmDiscard())) return;
+    if (discarding) setFileState({ status: "loading" });
     setPending(true);
     const result = await runSkillsCommand(
       setEnabled({ environmentId, input: { scope, skill: { entryId }, enabled } }),
       enabled ? "Could not enable the skill" : "Could not disable the skill",
     );
     setPending(false);
+    if (discarding) void load(file);
     if (result !== null && result.skippedLinks.length > 0) {
       toastManager.add({
         type: "warning",
@@ -134,7 +149,10 @@ export function SkillDetail(props: {
     }
   };
 
+  // Archiving drops any draft first; otherwise the page would keep showing the
+  // vanished skill to protect it.
   const archiveSkill = async () => {
+    if (!(await props.confirmDiscard())) return;
     if (
       !(await confirmSkillsAction(
         `Archive ${entry.name}?\nIt moves to Recovery and its provider links are removed. You can restore it from Recovery.`,
@@ -143,17 +161,24 @@ export function SkillDetail(props: {
     ) {
       return;
     }
+    const discarding = editorDirtyRef.current;
+    if (discarding) setFileState({ status: "loading" });
     setPending(true);
-    await runSkillsCommand(
+    const result = await runSkillsCommand(
       archive({ environmentId, input: { scope, name: entry.name } }),
       "Could not archive the skill",
     );
     setPending(false);
+    if (discarding && result === null) void load(file);
   };
 
   const isProjectPrivate = snapshot.scope.kind === "project" && snapshot.scope.mode !== "shared";
+  const isShared = snapshot.scope.kind === "project" && snapshot.scope.mode === "shared";
   const canToggle = entry.ownership === "managed" || isProjectPrivate;
-  const showLinks = entry.ownership === "managed" && entry.scope === "global" && entry.enabled;
+  // Shared snapshots only list links for skills kept directly in `.agents/skills`.
+  const showLinks =
+    (entry.ownership === "managed" && entry.scope === "global" && entry.enabled) ||
+    (isShared && entry.links.length > 0);
 
   return (
     <div className="flex min-w-0 flex-col gap-5">
@@ -239,9 +264,18 @@ export function SkillDetail(props: {
 
       {showLinks ? (
         <section className="flex flex-col gap-2">
-          <h3 className="text-sm font-medium">Provider links</h3>
+          <h3 className="text-sm font-medium">
+            {isShared ? "Repository links" : "Provider links"}
+          </h3>
+          {isShared ? (
+            <p className="text-xs text-muted-foreground">
+              Claude Code reads .claude/skills, not .agents/skills. Linking adds a relative symlink
+              to the repository so both read this folder. Nothing is linked until you ask.
+            </p>
+          ) : null}
           <SkillLinkTargets
             environmentId={environmentId}
+            scope={scope}
             subject={{ type: "skill", name: entry.name }}
             subjectLabel={entry.name}
             links={entry.links}
@@ -288,7 +322,7 @@ export function SkillDetail(props: {
             editable={fileState.result.entry.editable}
             readOnlyReason={readOnlyReason(entry)}
             onSave={saveFile}
-            onDirtyChange={props.onDirtyChange}
+            onDirtyChange={trackDirty}
             onReload={() =>
               void (async () => {
                 if (!(await props.confirmDiscard())) return;

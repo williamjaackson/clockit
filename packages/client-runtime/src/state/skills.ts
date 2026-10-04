@@ -376,6 +376,29 @@ export function scopeLibraryNames(snapshot: SkillsSnapshot): string[] {
 }
 
 /**
+ * The skill a create or import just wrote into this scope's library: a library
+ * skill by name, or in shared mode the repository folder of that name.
+ */
+export function findScopeLibraryEntry(snapshot: SkillsSnapshot, name: string): SkillEntry | null {
+  const libraryPath = snapshot.scope.libraryPath;
+  const inLibrary = (entryPath: string) =>
+    entryPath.length === libraryPath.length + 1 + name.length &&
+    entryPath.startsWith(libraryPath) &&
+    entryPath.endsWith(name);
+  return (
+    snapshot.entries.find(
+      (entry) =>
+        (entry.ownership === "managed" &&
+          entry.scope === snapshot.scope.kind &&
+          entry.name === name) ||
+        entry.origins.some(
+          (origin) => origin.symlinkTarget === undefined && inLibrary(origin.entryPath),
+        ),
+    ) ?? null
+  );
+}
+
+/**
  * Checks a new library skill name. Names compare case-insensitively because
  * the default macOS filesystem does.
  */

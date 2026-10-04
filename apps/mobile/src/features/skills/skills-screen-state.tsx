@@ -20,19 +20,29 @@ export function useSkillsScope(params: SkillsScopeParams) {
   return { scope, view };
 }
 
-/** Keeps an unsaved draft from being dropped by back gestures or buttons. */
+/**
+ * Keeps an unsaved draft from being dropped by back gestures or buttons, and
+ * holds the screen while a request it started is still running.
+ */
 export function SkillsDiscardGuard({
   dirty,
   saving,
+  leavingRef,
 }: {
   readonly dirty: boolean;
   readonly saving: boolean;
+  /** Set when the screen navigates away on its own after finishing, so the guard lets it. */
+  readonly leavingRef?: { readonly current: boolean };
 }) {
   const navigation = useNavigation();
   const preventRemove = dirty || saving;
   usePreventRemove(preventRemove, ({ data }) => {
+    if (leavingRef?.current) {
+      navigation.dispatch(data.action);
+      return;
+    }
     if (saving) {
-      Alert.alert("Saving", "Wait for the save to finish before leaving.");
+      Alert.alert("Still saving", "Wait for it to finish before leaving.");
       return;
     }
     Alert.alert("Discard changes?", "Your unsaved changes will be lost.", [

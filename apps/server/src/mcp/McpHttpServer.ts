@@ -26,6 +26,8 @@ import { EnvironmentToolkit } from "./toolkits/environment/tools.ts";
 import { EnvironmentHandlersLive } from "./toolkits/environment/handlers.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import { ProjectHandlersLive } from "./toolkits/project/handlers.ts";
+import { SkillsToolkit } from "./toolkits/skills/tools.ts";
+import { SkillsHandlersLive } from "./toolkits/skills/handlers.ts";
 import { AttachmentToolkit } from "./toolkits/attachment/tools.ts";
 import { AttachmentHandlersLive } from "./toolkits/attachment/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
@@ -687,6 +689,11 @@ const ProjectRegistrationLive = McpServer.toolkit(ProjectToolkit).pipe(
   Layer.provide(ProjectHandlersLive),
 );
 
+// Uses the server's one SkillLibrary, so agent edits share the app's mutation lock and change stream.
+const SkillsRegistrationLive = McpServer.toolkit(SkillsToolkit).pipe(
+  Layer.provide(SkillsHandlersLive),
+);
+
 const AttachmentRegistrationLive = McpServer.toolkit(AttachmentToolkit).pipe(
   Layer.provide(AttachmentHandlersLive),
 );
@@ -722,6 +729,7 @@ export const layer = Layer.mergeAll(
   AttachmentRegistrationLive,
   ProjectRegistrationLive,
   EnvironmentRegistrationLive,
+  SkillsRegistrationLive,
   PreviewControlsRegistrationLive,
   WorktreeToolkitRegistrationLive,
   PullRequestsToolkitRegistrationLive,

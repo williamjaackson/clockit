@@ -336,6 +336,9 @@ export const CodexProviderCapabilitiesV2 = {
   },
 } satisfies OrchestrationV2ProviderCapabilities;
 
+const SKILL_OVERLAY_PENDING_NOTICE =
+  "This project's skill or instruction settings changed. Codex applies them to new threads and to this one after it reloads; until then this thread keeps the setup it loaded with.";
+
 function toProtocolError(detail: string, payload?: unknown): ProviderAdapterProtocolError {
   return new ProviderAdapterProtocolError({
     driver: CODEX_PROVIDER,
@@ -1602,13 +1605,52 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
         const resolveSkillOverlay = (cwd: string | null | undefined) =>
           cwd == null || adapterOptions.resolveSkillOverlay === undefined
             ? Effect.succeed<PreparedSkillOverlay | undefined>(undefined)
-            : adapterOptions.resolveSkillOverlay(cwd);
+            : adapterOptions
+                .resolveSkillOverlay(cwd)
+                .pipe(
+                  Effect.catchTag("SkillOverlayError", (error) => toProtocolError(error.detail)),
+                );
+        const skillOverlayConfigKey = (overlay: PreparedSkillOverlay | undefined) =>
+          overlay === undefined ? "{}" : JSON.stringify(codexSkillOverlayThreadConfig(overlay));
         // Codex reads thread config when it loads a thread; a thread this
         // app-server already holds keeps the skills and AGENTS.md it loaded.
+        // So each thread keeps the overlay it loaded with until it is loaded
+        // again, as far as this connection saw it load.
+        const loadedSkillOverlays = new Map<
+          string,
+          { readonly overlay: PreparedSkillOverlay | undefined; readonly configKey: string }
+        >();
+        const recordLoadedSkillOverlay = (
+          nativeThreadId: string,
+          overlay: PreparedSkillOverlay | undefined,
+          options: { readonly ifAbsent?: boolean } = {},
+        ) => {
+          if (options.ifAbsent === true && loadedSkillOverlays.has(nativeThreadId)) return;
+          loadedSkillOverlays.set(nativeThreadId, {
+            overlay,
+            configKey: skillOverlayConfigKey(overlay),
+          });
+        };
+        /**
+         * The overlay a turn on this thread uses. When the project's native
+         * switches changed since the thread loaded, the thread keeps its
+         * loaded overlay whole, so its context never claims switches Codex
+         * is not applying; `pendingKey` names the change still waiting.
+         */
+        const threadSkillOverlay = (nativeThreadId: string, cwd: string | null | undefined) =>
+          Effect.gen(function* () {
+            const desired = yield* resolveSkillOverlay(cwd);
+            const loaded = loadedSkillOverlays.get(nativeThreadId);
+            const desiredKey = skillOverlayConfigKey(desired);
+            return loaded === undefined || loaded.configKey === desiredKey
+              ? { overlay: desired, pendingKey: undefined }
+              : { overlay: loaded.overlay, pendingKey: desiredKey };
+          });
+        const announcedPendingSkillOverlays = new Map<string, string>();
         const skillOverlayThreadConfig = (cwd: string | null | undefined) =>
           Effect.gen(function* () {
             const overlay = yield* resolveSkillOverlay(cwd ?? input.runtimePolicy.cwd);
-            if (overlay === undefined) return {};
+            if (overlay === undefined) return { overlay, config: {} };
             const config = codexSkillOverlayThreadConfig(overlay);
             const launchSettings = resolvedRuntime?.config ?? adapterOptions.settings;
             if (
@@ -1625,7 +1667,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 "Codex launch arguments set skills.config, which T3 would overwrite to switch off this project's repository skills. Move those rules to config.toml, or clear the project's skill changes in T3.",
               );
             }
-            return config;
+            return { overlay, config };
           });
         const additionalContextByThread = yield* Ref.make(
           new Map<
@@ -4088,6 +4130,38 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           });
         });
 
+        const emitSkillOverlayPendingNotice = Effect.fn(
+          "CodexAdapterV2.emitSkillOverlayPendingNotice",
+        )(function* (context: ActiveCodexTurnContext) {
+          const nativeItemId = `skill-overlay-pending:${context.nativeTurnId}`;
+          const { ordinal, startedAt } = yield* resolveItemPosition(context, nativeItemId);
+          yield* emitProviderEvent({
+            type: "turn_item.updated",
+            driver: CODEX_PROVIDER,
+            turnItem: {
+              id: idAllocator.derive.turnItemFromProviderItem({
+                driver: CODEX_PROVIDER,
+                nativeItemId,
+              }),
+              threadId: context.projectionThreadId,
+              runId: context.projectionRunId,
+              nodeId: context.providerNodeId,
+              providerThreadId: context.providerThread.id,
+              providerTurnId: context.providerTurnId,
+              nativeItemRef: codexNativeItemRef(nativeItemId),
+              parentItemId: null,
+              ordinal,
+              type: "system_notice",
+              status: "completed",
+              title: SKILL_OVERLAY_PENDING_NOTICE,
+              message: SKILL_OVERLAY_PENDING_NOTICE,
+              startedAt,
+              completedAt: startedAt,
+              updatedAt: startedAt,
+            },
+          });
+        });
+
         yield* client.handleServerNotification("item/started", (payload) =>
           Effect.gen(function* () {
             const context = yield* awaitActiveTurn(payload.turnId);
@@ -5454,16 +5528,24 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           ensureThread: (threadInput) =>
             ensureInitialized.pipe(
               Effect.andThen(skillOverlayThreadConfig(threadInput.runtimePolicy.cwd)),
-              Effect.flatMap((skillOverlayConfig) =>
-                client.request(
-                  "thread/start",
-                  codexThreadRuntimeParams({
-                    threadId: threadInput.threadId,
-                    modelSelection: threadInput.modelSelection,
-                    runtimePolicy: threadInput.runtimePolicy,
-                    skillOverlayConfig,
-                  }),
-                ),
+              Effect.flatMap((skillOverlay) =>
+                client
+                  .request(
+                    "thread/start",
+                    codexThreadRuntimeParams({
+                      threadId: threadInput.threadId,
+                      modelSelection: threadInput.modelSelection,
+                      runtimePolicy: threadInput.runtimePolicy,
+                      skillOverlayConfig: skillOverlay.config,
+                    }),
+                  )
+                  .pipe(
+                    Effect.tap((response) =>
+                      Effect.sync(() =>
+                        recordLoadedSkillOverlay(response.thread.id, skillOverlay.overlay),
+                      ),
+                    ),
+                  ),
               ),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
@@ -5487,9 +5569,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           resumeThread: (threadInput) =>
             Effect.gen(function* () {
               const nativeThreadId = yield* getNativeThreadId(threadInput.providerThread);
-              const skillOverlayConfig = yield* skillOverlayThreadConfig(
-                threadInput.runtimePolicy?.cwd,
-              );
+              const skillOverlay = yield* skillOverlayThreadConfig(threadInput.runtimePolicy?.cwd);
               // excludeTurns is not in the generated request schema yet.
               const resume = client.raw.request("thread/resume", {
                 threadId: nativeThreadId,
@@ -5502,7 +5582,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                   ...(threadInput.runtimePolicy === undefined
                     ? {}
                     : { runtimePolicy: threadInput.runtimePolicy }),
-                  skillOverlayConfig,
+                  skillOverlayConfig: skillOverlay.config,
                 }),
               });
               const response = yield* ensureInitialized.pipe(
@@ -5527,6 +5607,10 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 ),
                 Effect.flatMap(decodeCodexResumeMetadata),
               );
+              // Resuming a thread this connection already loaded leaves its config.
+              recordLoadedSkillOverlay(response.thread.id, skillOverlay.overlay, {
+                ifAbsent: true,
+              });
               return {
                 ...threadInput.providerThread,
                 providerSessionId: input.providerSessionId,
@@ -5610,7 +5694,10 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             Effect.gen(function* () {
               const threadId = yield* getNativeThreadId(turnInput.providerThread);
 
-              const skillOverlay = yield* resolveSkillOverlay(turnInput.runtimePolicy.cwd);
+              const { overlay: skillOverlay, pendingKey } = yield* threadSkillOverlay(
+                threadId,
+                turnInput.runtimePolicy.cwd,
+              );
               const codexInput =
                 turnInput.restartContinuationOfRunId === undefined
                   ? yield* toCodexInput(turnInput, skillOverlay)
@@ -5642,12 +5729,19 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               const started = yield* client.request("turn/start", turnStartParams);
               const nativeTurnId = started.turn.id;
               const startedAt = codexTimestamp(started.turn.startedAt);
-              yield* registerRootTurn({
+              const turnContext = yield* registerRootTurn({
                 turnInput,
                 nativeTurnId,
                 startedAt,
                 waitForNativeStart: started.turn.startedAt === null,
               });
+              if (
+                pendingKey !== undefined &&
+                announcedPendingSkillOverlays.get(threadId) !== pendingKey
+              ) {
+                announcedPendingSkillOverlays.set(threadId, pendingKey);
+                yield* emitSkillOverlayPendingNotice(turnContext);
+              }
               yield* Ref.update(pendingRootTurns, (current) => {
                 const updated = new Map(current);
                 updated.delete(threadId);
@@ -5688,7 +5782,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
 
               const codexInput = yield* toCodexInput(
                 turnInput,
-                yield* resolveSkillOverlay(activeTurn.input.runtimePolicy.cwd),
+                (yield* threadSkillOverlay(threadId, activeTurn.input.runtimePolicy.cwd)).overlay,
               );
               yield* client.request("turn/steer", {
                 expectedTurnId: activeTurn.nativeTurnId,
@@ -6243,6 +6337,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               // process. After a restart or idle release, load it the same way
               // the next turn would before reverting.
               if (!loaded) {
+                const skillOverlay = yield* skillOverlayThreadConfig(input.runtimePolicy.cwd);
                 yield* client.raw.request("thread/resume", {
                   threadId,
                   excludeTurns: true,
@@ -6250,9 +6345,10 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                     threadId: threadInput.providerThread.appThreadId,
                     modelSelection: input.modelSelection,
                     runtimePolicy: input.runtimePolicy,
-                    skillOverlayConfig: yield* skillOverlayThreadConfig(input.runtimePolicy.cwd),
+                    skillOverlayConfig: skillOverlay.config,
                   }),
                 });
+                recordLoadedSkillOverlay(threadId, skillOverlay.overlay);
               }
               const response = yield* ensureInitialized.pipe(
                 Effect.andThen(revertCodexThread(client, threadId, numTurns)),
@@ -6289,9 +6385,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             Effect.gen(function* () {
               const threadId = yield* getNativeThreadId(threadInput.sourceProviderThread);
               const boundary = yield* resolveCodexForkBoundary(threadInput);
-              const skillOverlayConfig = yield* skillOverlayThreadConfig(
-                threadInput.runtimePolicy?.cwd,
-              );
+              const skillOverlay = yield* skillOverlayThreadConfig(threadInput.runtimePolicy?.cwd);
               const response = yield* ensureInitialized.pipe(
                 Effect.andThen(
                   client.request("thread/fork", {
@@ -6307,7 +6401,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                       ...(threadInput.runtimePolicy === undefined
                         ? {}
                         : { runtimePolicy: threadInput.runtimePolicy }),
-                      skillOverlayConfig,
+                      skillOverlayConfig: skillOverlay.config,
                     }),
                   }),
                 ),
@@ -6320,6 +6414,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                     }),
                 ),
               );
+              recordLoadedSkillOverlay(response.thread.id, skillOverlay.overlay);
               let forkedThread = response.thread;
               if (boundary.rollbackTurnCount > 0) {
                 // Reached only when the selected source turn has no native

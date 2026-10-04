@@ -1,18 +1,23 @@
-// @effect-diagnostics nodeBuiltinImport:off - the worktree test builds real Git
-// worktree metadata with the git CLI, outside the service under test.
+// @effect-diagnostics nodeBuiltinImport:off - the worktree tests build real Git
+// worktree metadata with the git CLI and hash a legacy profile's folder name,
+// outside the service under test.
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import type { SkillEntry, SkillsSnapshot } from "@t3tools/contracts";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
 import * as Result from "effect/Result";
+import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -23,6 +28,8 @@ import * as SkillLibrary from "./SkillLibrary.ts";
  * `HostProcessEnvironment`, so every provider folder lands in the temp tree.
  * `faults.readLink` makes the service's `readLink` fail for one path, which
  * fails the snapshot at the end of a mutation after every change is made.
+ * `faults.rename` fails renames onto matching paths, which is how atomic
+ * writes land, so it fails one metadata write.
  */
 const makeWorld = (options: { readonly env?: Record<string, string> } = {}) =>
   Effect.gen(function* () {
@@ -37,9 +44,20 @@ const makeWorld = (options: { readonly env?: Record<string, string> } = {}) =>
     yield* Effect.forEach([home, baseDir, project], (directory) =>
       fileSystem.makeDirectory(directory, { recursive: true }),
     );
-    const faults: { readLink?: string } = {};
+    const faults: { readLink?: string; rename?: (to: string) => boolean } = {};
     const faultyFileSystem: FileSystem.FileSystem = {
       ...fileSystem,
+      rename: (from, to) =>
+        faults.rename?.(to)
+          ? Effect.fail(
+              PlatformError.systemError({
+                _tag: "PermissionDenied",
+                module: "FileSystem",
+                method: "rename",
+                pathOrDescriptor: to,
+              }),
+            )
+          : fileSystem.rename(from, to),
       readLink: (target) =>
         faults.readLink === target
           ? Effect.fail(
@@ -52,14 +70,15 @@ const makeWorld = (options: { readonly env?: Record<string, string> } = {}) =>
             )
           : fileSystem.readLink(target),
     };
-    const library = yield* SkillLibrary.SkillLibrary.pipe(
-      Effect.provide(
-        SkillLibrary.layer.pipe(
-          Layer.provide(
-            Layer.mergeAll(ServerConfig.layerTest(root, baseDir), ServerSettings.layerTest()),
-          ),
+    // Built into the test's scope: the service shuts its change stream down with it.
+    const library = yield* Layer.build(
+      SkillLibrary.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(ServerConfig.layerTest(root, baseDir), ServerSettings.layerTest()),
         ),
       ),
+    ).pipe(
+      Effect.map((context) => Context.get(context, SkillLibrary.SkillLibrary)),
       Effect.provideService(HostProcessEnvironment, { HOME: home, ...options.env }),
       Effect.provideService(FileSystem.FileSystem, faultyFileSystem),
     );
@@ -615,8 +634,19 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
         expect(value.projectRoot).toBe(project);
         expect(value.skills.map((skill) => skill.name)).toEqual(["repo-skill"]);
         expect(value.suppressedRepoSkills).toEqual([
-          { name: "other", path: path.join(project, ".agents/skills/other"), reason: "disabled" },
+          {
+            name: "other",
+            folderName: "other",
+            path: path.join(project, ".agents/skills/other"),
+            reason: "disabled",
+          },
           { name: "repo-skill", path: null, reason: "replaced" },
+          {
+            name: "repo-skill",
+            folderName: "repo-skill",
+            path: path.join(project, ".claude/skills/repo-skill"),
+            reason: "replaced",
+          },
         ]);
         expect(value.instructions).toMatchObject({ mode: "append", content: "Private notes" });
 
@@ -1097,6 +1127,105 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
         ).toBe(false);
       }),
     );
+
+    it.effect("saves, instructions, and settings that fail late change nothing", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        const state = Effect.all({
+          t3: world.fingerprint(world.baseDir),
+          repo: world.fingerprint(project),
+        });
+        const failLate = <A, E>(effect: Effect.Effect<A, E>, fault: typeof world.faults) =>
+          Effect.gen(function* () {
+            const before = yield* state;
+            Object.assign(world.faults, fault);
+            const failure = yield* effect.pipe(Effect.flip);
+            delete world.faults.readLink;
+            delete world.faults.rename;
+            expect(failure).toMatchObject({ reason: "filesystem" });
+            expect(yield* state).toEqual(before);
+          });
+        const scope = { projectPath: project };
+        const manifestWrite = { rename: (to: string) => path.basename(to) === "manifest.json" };
+
+        // A project's first private change also writes its manifest, last.
+        yield* failLate(
+          world.library.save({
+            scope,
+            skill: { name: "mine" },
+            content: "v1",
+            expectedRevision: null,
+          }),
+          manifestWrite,
+        );
+        yield* failLate(
+          world.library.saveInstructions({ scope, content: "Notes", expectedRevision: null }),
+          manifestWrite,
+        );
+        yield* world.write(path.join(project, "CLAUDE.md"), "Repo rules");
+        yield* failLate(
+          world.library.importInstructions({ scope, sourceId: "repo:CLAUDE.md" }),
+          manifestWrite,
+        );
+        expect(yield* world.exists(path.join(world.baseDir, "skill-projects"))).toBe(false);
+
+        const created = yield* world.library.save({
+          scope,
+          skill: { name: "mine" },
+          content: "v1",
+          expectedRevision: null,
+        });
+        const notes = yield* world.library.saveInstructions({
+          scope,
+          content: "Notes",
+          expectedRevision: null,
+        });
+        // The snapshot at the end of a mutation reads the repository's instructions.
+        const snapshotRead = { readLink: path.join(project, "AGENTS.md") };
+        yield* failLate(
+          world.library.save({
+            scope,
+            skill: { name: "mine" },
+            content: "v2",
+            expectedRevision: created.revision,
+          }),
+          snapshotRead,
+        );
+        yield* failLate(
+          world.library.save({
+            scope,
+            skill: { name: "fresh" },
+            file: "SKILL.md",
+            content: "new",
+            expectedRevision: null,
+          }),
+          snapshotRead,
+        );
+        yield* failLate(
+          world.library.updateProjectSettings({ projectPath: project, instructionMode: "append" }),
+          snapshotRead,
+        );
+        yield* failLate(
+          world.library.save({
+            scope: {},
+            skill: { name: "global" },
+            content: "x",
+            expectedRevision: null,
+          }),
+          { readLink: path.join(world.baseDir, "instructions/AGENTS.md") },
+        );
+
+        const mine = yield* world.library.read({ scope, skill: { name: "mine" } });
+        expect(mine).toMatchObject({ content: "v1", revision: created.revision });
+        expect(
+          yield* world.exists(path.join(path.dirname(path.dirname(created.path)), "fresh")),
+        ).toBe(false);
+        expect(yield* world.exists(path.join(world.baseDir, "skills"))).toBe(false);
+        const instructions = yield* world.library.readInstructions({ scope });
+        expect(instructions).toMatchObject({ revision: notes.revision, mode: "inherit" });
+      }),
+    );
   });
 
   describe("worktrees", () => {
@@ -1134,6 +1263,7 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
         expect(fromWorktree.suppressedRepoSkills).toEqual([
           {
             name: "repo-skill",
+            folderName: "repo-skill",
             path: path.join(worktree, ".claude/skills/repo-skill"),
             reason: "disabled",
           },
@@ -1141,7 +1271,7 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
         expect(fromWorktree.instructions.globalInstructionsEnabled).toBe(true);
         expect(Option.isNone(yield* world.library.resolveProjectOverlay(other))).toBe(true);
 
-        // A profile for a sub-project is matched folder for folder.
+        // A sub-project without a profile of its own edits the one it inherits.
         yield* world.library.updateProjectSettings({
           projectPath: path.join(project, "packages/app"),
           instructionMode: "off",
@@ -1149,19 +1279,405 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
         const nested = Option.getOrThrow(
           yield* world.library.resolveProjectOverlay(path.join(worktree, "packages/app/src")),
         );
-        expect(nested.projectRoot).toBe(path.join(worktree, "packages/app"));
+        expect(nested.projectRoot).toBe(worktree);
         expect(nested.instructions.mode).toBe("off");
 
-        // The worktree's own profile wins over inherited ones, even deeper ones.
+        // Settings changed from the worktree land in the primary checkout's profile.
         yield* world.library.updateProjectSettings({
           projectPath: worktree,
           instructionMode: "replace",
         });
-        const own = Option.getOrThrow(
-          yield* world.library.resolveProjectOverlay(path.join(worktree, "packages/app/src")),
+        const shared = Option.getOrThrow(yield* world.library.resolveProjectOverlay(worktree));
+        expect(shared.provenance).toMatchObject({ profileRoot: project, source: "worktree" });
+        expect(shared.instructions.mode).toBe("replace");
+        expect(
+          Option.getOrThrow(yield* world.library.resolveProjectOverlay(project)).instructions.mode,
+        ).toBe("replace");
+      }),
+    );
+
+    it.effect("managing a worktree edits the profile its agents use", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        yield* world.writeSkill(path.join(project, ".claude/skills/repo-skill"), "Repo skill");
+        yield* world.git(project, "init", "--quiet", "--initial-branch=main");
+        yield* world.git(project, "add", ".");
+        yield* world.git(project, "commit", "--quiet", "-m", "init");
+        const worktree = path.join(world.root, "worktrees/feature");
+        yield* world.git(project, "worktree", "add", "--quiet", "-b", "feature", worktree);
+        const primary = { projectPath: project };
+        yield* world.library.save({
+          scope: primary,
+          skill: { name: "mine" },
+          content: "v1",
+          expectedRevision: null,
+        });
+        yield* world.library.saveInstructions({
+          scope: primary,
+          content: "Notes",
+          expectedRevision: null,
+        });
+        yield* world.library.updateProjectSettings({
+          projectPath: project,
+          instructionMode: "append",
+        });
+        const primaryLibrary = (yield* world.library.list({ scope: primary })).scope.libraryPath;
+
+        const wt = { projectPath: worktree };
+        const listed = yield* world.library.list({ scope: wt });
+        expect(listed.scope).toMatchObject({
+          projectRoot: worktree,
+          profileRoot: project,
+          profileSource: "worktree",
+          libraryPath: primaryLibrary,
+        });
+        expect(entryNamed(listed, "mine", "managed").enabled).toBe(true);
+        expect(entryNamed(listed, "repo-skill").path).toBe(
+          path.join(worktree, ".claude/skills/repo-skill"),
         );
-        expect(own.provenance).toMatchObject({ profileRoot: worktree, source: "project" });
-        expect(own.instructions.mode).toBe("replace");
+        expect(listed.instructions.mode).toBe("append");
+
+        const read = yield* world.library.read({ scope: wt, skill: { name: "mine" } });
+        expect(read.content).toBe("v1");
+        yield* world.library.save({
+          scope: wt,
+          skill: { name: "mine" },
+          content: "v2",
+          expectedRevision: read.revision,
+        });
+        const doc = yield* world.library.readInstructions({ scope: wt });
+        expect(doc).toMatchObject({ content: "Notes", mode: "append" });
+        yield* world.library.saveInstructions({
+          scope: wt,
+          content: "Notes v2",
+          expectedRevision: doc.revision,
+        });
+        yield* world.library.setEnabled({
+          scope: wt,
+          skill: { entryId: entryNamed(listed, "repo-skill").id },
+          enabled: false,
+        });
+        const archived = yield* world.library.archive({ scope: wt, name: "mine" });
+        expect(
+          (yield* world.library.list({ scope: primary })).recovery.map((entry) => entry.id),
+        ).toEqual([archived.recovery.id]);
+        yield* world.library.restore({ scope: wt, recoveryId: archived.recovery.id });
+
+        const fromPrimary = yield* world.library.list({ scope: primary });
+        expect(fromPrimary.instructions.mode).toBe("append");
+        expect(entryNamed(fromPrimary, "repo-skill").enabled).toBe(false);
+        expect(
+          (yield* world.library.read({ scope: primary, skill: { name: "mine" } })).content,
+        ).toBe("v2");
+        expect((yield* world.library.readInstructions({ scope: primary })).content).toBe(
+          "Notes v2",
+        );
+        expect(
+          yield* world.fileSystem.readDirectory(path.join(world.baseDir, "skill-projects")),
+        ).toHaveLength(1);
+        for (const [cwd, root] of [
+          [project, project],
+          [worktree, worktree],
+        ] as const) {
+          const overlay = Option.getOrThrow(yield* world.library.resolveProjectOverlay(cwd));
+          expect(overlay.instructions).toMatchObject({ mode: "append", content: "Notes v2" });
+          expect(overlay.skills.map((skill) => skill.name)).toEqual(["mine"]);
+          expect(overlay.suppressedRepoSkills[0]).toEqual({
+            name: "repo-skill",
+            folderName: "repo-skill",
+            path: path.join(root, ".claude/skills/repo-skill"),
+            reason: "disabled",
+          });
+        }
+      }),
+    );
+  });
+
+  describe("nested projects", () => {
+    /** Management and agents in `projectPath` must read one profile, one way. */
+    const expectSameProfile = (
+      world: Effect.Success<ReturnType<typeof makeWorld>>,
+      projectPath: string,
+    ) =>
+      Effect.gen(function* () {
+        const listed = yield* world.library.list({ scope: { projectPath } });
+        const overlay = Option.getOrThrow(yield* world.library.resolveProjectOverlay(projectPath));
+        expect(overlay.provenance).toMatchObject({
+          profileRoot: listed.scope.profileRoot,
+          source: listed.scope.profileSource,
+        });
+        expect(overlay.instructions.mode).toBe(listed.instructions.mode);
+        expect(overlay.instructions.path).toBe(listed.instructions.canonicalPath);
+        return { listed, overlay };
+      });
+
+    it.effect("a sub-project manages the profile its agents inherit", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        const app = path.join(project, "packages/app");
+        yield* world.writeSkill(path.join(project, ".claude/skills/top"), "Top");
+        yield* world.writeSkill(path.join(app, ".claude/skills/sub-skill"), "Sub");
+        yield* world.writeSkill(path.join(app, ".claude/skills/dup"), "Dup");
+        const repo = yield* world.fingerprint(project);
+        const parent = { projectPath: project };
+        yield* world.library.setEnabled({
+          scope: parent,
+          skill: { entryId: entryNamed(yield* world.library.list({ scope: parent }), "top").id },
+          enabled: false,
+        });
+        yield* world.library.saveInstructions({
+          scope: parent,
+          content: "Notes",
+          expectedRevision: null,
+        });
+        yield* world.library.updateProjectSettings({
+          projectPath: project,
+          instructionMode: "append",
+        });
+
+        const nested = { projectPath: app };
+        const { listed, overlay: inherited } = yield* expectSameProfile(world, app);
+        expect(listed.scope).toMatchObject({
+          projectRoot: app,
+          profileRoot: project,
+          profileSource: "project",
+        });
+        expect(listed.instructions.mode).toBe("append");
+        expect(inherited.projectRoot).toBe(project);
+        expect((yield* world.library.readInstructions({ scope: nested })).content).toBe("Notes");
+
+        // Edits from the sub-project land in the inherited profile and keep its settings.
+        yield* world.library.setEnabled({
+          scope: nested,
+          skill: { entryId: entryNamed(listed, "sub-skill").id },
+          enabled: false,
+        });
+        yield* world.library.save({
+          scope: nested,
+          skill: { name: "dup" },
+          content: "---\ndescription: Private\n---\nPrivate\n",
+          expectedRevision: null,
+        });
+        const { listed: edited, overlay } = yield* expectSameProfile(world, app);
+        expect(entryNamed(edited, "sub-skill").enabled).toBe(false);
+        expect(entryNamed(edited, "dup", "unmanaged").enabled).toBe(false);
+        expect(entryNamed(edited, "dup", "managed").enabled).toBe(true);
+        expect(overlay.instructions).toMatchObject({ mode: "append", content: "Notes" });
+        expect(overlay.skills.map((skill) => skill.name)).toEqual(["dup"]);
+        expect(overlay.suppressedRepoSkills).toEqual([
+          {
+            name: "top",
+            folderName: "top",
+            path: path.join(project, ".claude/skills/top"),
+            reason: "disabled",
+          },
+          {
+            name: "sub-skill",
+            folderName: "sub-skill",
+            path: path.join(app, ".claude/skills/sub-skill"),
+            reason: "disabled",
+          },
+          { name: "dup", path: null, reason: "replaced" },
+          {
+            name: "dup",
+            folderName: "dup",
+            path: path.join(app, ".claude/skills/dup"),
+            reason: "replaced",
+          },
+        ]);
+        const fromParent = yield* world.library.list({ scope: parent });
+        expect(entryNamed(fromParent, "top").enabled).toBe(false);
+        expect(entryNamed(fromParent, "dup", "managed").enabled).toBe(true);
+        expect(
+          yield* world.fileSystem.readDirectory(path.join(world.baseDir, "skill-projects")),
+        ).toHaveLength(1);
+
+        // Undoing each change from the sub-project clears what agents get.
+        yield* world.library.setEnabled({
+          scope: nested,
+          skill: { entryId: entryNamed(edited, "sub-skill").id },
+          enabled: true,
+        });
+        yield* world.library.archive({ scope: nested, name: "dup" });
+        yield* world.library.setEnabled({
+          scope: parent,
+          skill: { entryId: entryNamed(fromParent, "top").id },
+          enabled: true,
+        });
+        yield* world.library.updateProjectSettings({
+          projectPath: app,
+          instructionMode: "inherit",
+        });
+        const cleared = yield* world.library.list({ scope: nested });
+        expect(cleared.scope.profileRoot).toBe(project);
+        expect(cleared.entries.every((entry) => entry.enabled)).toBe(true);
+        expect(cleared.instructions.mode).toBe("inherit");
+        for (const cwd of [project, app]) {
+          expect(Option.isNone(yield* world.library.resolveProjectOverlay(cwd))).toBe(true);
+        }
+        expect(yield* world.fingerprint(project)).toEqual(repo);
+      }),
+    );
+
+    it.effect("a profile of a folder's own keeps priority over an enclosing one", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        const app = path.join(project, "packages/app");
+        yield* world.fileSystem.makeDirectory(app, { recursive: true });
+        yield* world.library.updateProjectSettings({ projectPath: app, instructionMode: "off" });
+        yield* world.library.updateProjectSettings({
+          projectPath: project,
+          instructionMode: "append",
+        });
+
+        const { listed, overlay } = yield* expectSameProfile(world, app);
+        expect(listed.scope).toMatchObject({ profileRoot: app, profileSource: "project" });
+        expect(overlay).toMatchObject({ projectRoot: app, instructions: { mode: "off" } });
+        const { listed: fromParent } = yield* expectSameProfile(world, project);
+        expect(fromParent.instructions.mode).toBe("append");
+      }),
+    );
+
+    it.effect("a sub-project of a worktree uses the primary checkout's root profile", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        yield* world.writeSkill(path.join(project, "packages/app/.claude/skills/app-skill"), "App");
+        yield* world.git(project, "init", "--quiet", "--initial-branch=main");
+        yield* world.git(project, "add", ".");
+        yield* world.git(project, "commit", "--quiet", "-m", "init");
+        const worktree = path.join(world.root, "worktrees/feature");
+        yield* world.git(project, "worktree", "add", "--quiet", "-b", "feature", worktree);
+        yield* world.library.updateProjectSettings({
+          projectPath: project,
+          instructionMode: "append",
+        });
+        const repo = yield* world.fingerprint(worktree);
+
+        const app = path.join(worktree, "packages/app");
+        const { listed } = yield* expectSameProfile(world, app);
+        expect(listed.scope).toMatchObject({
+          projectRoot: app,
+          profileRoot: project,
+          profileSource: "worktree",
+        });
+        yield* world.library.setEnabled({
+          scope: { projectPath: app },
+          skill: { entryId: entryNamed(listed, "app-skill").id },
+          enabled: false,
+        });
+        for (const root of [worktree, project]) {
+          const { listed: sub, overlay } = yield* expectSameProfile(
+            world,
+            path.join(root, "packages/app"),
+          );
+          expect(entryNamed(sub, "app-skill").enabled).toBe(false);
+          expect(overlay.projectRoot).toBe(root);
+          expect(overlay.suppressedRepoSkills).toEqual([
+            {
+              name: "app-skill",
+              folderName: "app-skill",
+              path: path.join(root, "packages/app/.claude/skills/app-skill"),
+              reason: "disabled",
+            },
+          ]);
+        }
+
+        // A profile written for the worktree itself, as older versions did, still wins.
+        yield* world.write(
+          path.join(
+            world.baseDir,
+            "skill-projects",
+            NodeCrypto.createHash("sha256").update(worktree).digest("hex").slice(0, 16),
+            "manifest.json",
+          ),
+          JSON.stringify({
+            version: 1,
+            projectRoot: worktree,
+            disabledRepoSkills: [],
+            instructionMode: "off",
+            globalInstructionsEnabled: true,
+          }),
+        );
+        const { listed: legacy, overlay } = yield* expectSameProfile(world, app);
+        expect(legacy.scope).toMatchObject({ profileRoot: worktree, profileSource: "project" });
+        expect(overlay.instructions.mode).toBe("off");
+        expect(entryNamed(legacy, "app-skill").enabled).toBe(true);
+        expect(yield* world.fingerprint(worktree)).toEqual(repo);
+      }),
+    );
+  });
+
+  describe("change notifications", () => {
+    it.effect("announces committed mutations only, after they commit", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        const globalSkill = path.join(world.baseDir, "skills/mine/SKILL.md");
+        const events = yield* Queue.unbounded<{
+          readonly change: SkillLibrary.SkillLibraryChange;
+          readonly content: string | undefined;
+        }>();
+        yield* world.library.streamChanges.pipe(
+          Stream.runForEach((change) =>
+            world.read(globalSkill).pipe(
+              Effect.option,
+              Effect.flatMap((content) =>
+                Queue.offer(events, { change, content: Option.getOrUndefined(content) }),
+              ),
+            ),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        );
+
+        const rejected = yield* world.library
+          .save({
+            scope: { projectPath: project },
+            skill: { name: "mine" },
+            content: "x",
+            expectedRevision: "stale",
+          })
+          .pipe(Effect.flip);
+        expect(rejected.reason).toBe("notFound");
+        world.faults.readLink = path.join(world.baseDir, "instructions/AGENTS.md");
+        yield* world.library
+          .save({
+            scope: {},
+            skill: { name: "mine" },
+            content: "rolled back",
+            expectedRevision: null,
+          })
+          .pipe(Effect.flip);
+        delete world.faults.readLink;
+
+        yield* world.library.save({
+          scope: {},
+          skill: { name: "mine" },
+          content: "v1",
+          expectedRevision: null,
+        });
+        expect(yield* Queue.take(events)).toEqual({ change: {}, content: "v1" });
+
+        yield* world.library.list({ scope: {} });
+        yield* world.library.read({ scope: {}, skill: { name: "mine" } });
+        yield* world.library.updateProjectSettings({
+          projectPath: project,
+          instructionMode: "off",
+        });
+        expect((yield* Queue.take(events)).change).toEqual({
+          projectRoot: project,
+          profileRoot: project,
+        });
+        yield* world.library.saveInstructions({
+          scope: { projectPath: project, mode: "shared" },
+          content: "Team",
+          expectedRevision: null,
+        });
+        expect((yield* Queue.take(events)).change).toEqual({ projectRoot: project });
+        expect(yield* Queue.size(events)).toBe(0);
       }),
     );
   });
@@ -1219,10 +1735,17 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
         expect(overlay.suppressedRepoSkills).toEqual([
           {
             name: "lint",
+            folderName: "lint-folder",
             path: path.join(project, ".agents/skills/lint-folder"),
             reason: "disabled",
           },
           { name: "deploy", path: null, reason: "replaced" },
+          {
+            name: "deploy",
+            folderName: "repo-folder",
+            path: path.join(project, ".claude/skills/repo-folder"),
+            reason: "replaced",
+          },
         ]);
       }),
     );
@@ -1311,6 +1834,59 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
           "Team",
         );
         expect(yield* world.read(path.join(project, "AGENTS.md"))).toBe("Shared rules");
+      }),
+    );
+  });
+
+  describe("shared instruction paths", () => {
+    it.effect("follows links only while they stay inside the checkout", () =>
+      Effect.gen(function* () {
+        const world = yield* makeWorld();
+        const { path, project } = world;
+        const outside = path.join(world.root, "outside.md");
+        yield* world.write(outside, "External");
+        const alias = path.join(world.root, "alias");
+        yield* world.symlink(project, alias);
+        yield* world.symlink(outside, path.join(project, "CLAUDE.md"));
+        const shared = { projectPath: alias, mode: "shared" as const };
+
+        const readOut = yield* world.library
+          .readInstructions({ scope: shared, file: "CLAUDE.md" })
+          .pipe(Effect.flip);
+        expect(readOut.reason).toBe("readOnly");
+        const writeOut = yield* world.library
+          .saveInstructions({
+            scope: shared,
+            file: "CLAUDE.md",
+            content: "x",
+            expectedRevision: null,
+          })
+          .pipe(Effect.flip);
+        expect(writeOut.reason).toBe("readOnly");
+        expect(yield* world.read(outside)).toBe("External");
+
+        const saved = yield* world.library.saveInstructions({
+          scope: shared,
+          content: "Team",
+          expectedRevision: null,
+        });
+        expect(saved.path).toBe(path.join(project, "AGENTS.md"));
+        yield* world.fileSystem.remove(path.join(project, "CLAUDE.md"));
+        yield* world.symlink("AGENTS.md", path.join(project, "CLAUDE.md"));
+        const viaLink = yield* world.library.readInstructions({ scope: shared, file: "CLAUDE.md" });
+        expect(viaLink.content).toBe("Team");
+        yield* world.library.saveInstructions({
+          scope: shared,
+          file: "CLAUDE.md",
+          content: "Team v2",
+          expectedRevision: viaLink.revision,
+        });
+        expect(yield* world.read(path.join(project, "AGENTS.md"))).toBe("Team v2");
+        expect(yield* world.readLink(path.join(project, "CLAUDE.md"))).toBe("AGENTS.md");
+
+        yield* world.write(path.join(project, "AGENTS.md"), "x".repeat(2_000_001));
+        const large = yield* world.library.readInstructions({ scope: shared }).pipe(Effect.flip);
+        expect(large.reason).toBe("unsupported");
       }),
     );
   });

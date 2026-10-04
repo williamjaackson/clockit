@@ -6,6 +6,7 @@ import type {
   SkillLinkSubject,
   SkillOwnership,
   SkillPathKind,
+  SkillScope,
 } from "@t3tools/contracts";
 import { isUnlinkedLibrarySkill, providerDisplayName } from "@t3tools/client-runtime/state/skills";
 import { useEffect, useState, type ReactNode } from "react";
@@ -167,9 +168,13 @@ const OCCUPANT_LABEL: Record<SkillPathKind, string> = {
   symlink: "link",
 };
 
-/** Link state per provider folder for one global library skill or the global instructions. */
+/**
+ * Link state per target for one subject: a global library skill or the global
+ * instructions, or in shared mode a repository skill or `AGENTS.md`.
+ */
 export function SkillLinkRows(props: {
   readonly environmentId: EnvironmentId;
+  readonly scope: SkillScope;
   readonly subject: SkillLinkSubject;
   readonly subjectLabel: string;
   readonly links: ReadonlyArray<SkillLinkStatus>;
@@ -197,7 +202,7 @@ export function SkillLinkRows(props: {
       ? runSkillsCommand(
           unlink({
             environmentId: props.environmentId,
-            input: { subject: props.subject, targetIds },
+            input: { scope: props.scope, subject: props.subject, targetIds },
           }),
           "Could not unlink",
         )
@@ -205,6 +210,7 @@ export function SkillLinkRows(props: {
           link({
             environmentId: props.environmentId,
             input: {
+              scope: props.scope,
               subject: props.subject,
               targetIds,
               replace: status.state === "occupied",

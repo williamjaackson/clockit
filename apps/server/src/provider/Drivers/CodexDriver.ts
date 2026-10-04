@@ -52,6 +52,7 @@ import { resolveCodexLaunchArgs } from "../Layers/codexLaunchArgs.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   applySkillOverlayToCatalog,
+  resolveCatalogSkillOverlay,
   skillOverlayResolverFromContext,
 } from "../ProviderSkillOverlay.ts";
 import * as ModelManifest from "../ModelManifest.ts";
@@ -283,33 +284,39 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       const snapshotForCwd = (cwd: string) =>
         !effectiveConfig.enabled
           ? snapshot.getSnapshot
-          : Effect.all([
-              snapshot.getSnapshot,
-              probeCodexSkillsForCwd({
-                binaryPath: effectiveConfig.binaryPath,
-                homePath: effectiveConfig.homePath,
-                launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
-                cwd,
-                environment: processEnv,
-              }).pipe(
-                Effect.scoped,
-                Effect.timeout("20 seconds"),
-                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-              ),
-              resolveSkillOverlay === undefined ? Effect.undefined : resolveSkillOverlay(cwd),
-            ]).pipe(
-              Effect.map(([machineSnapshot, skills, skillOverlay]) => ({
-                ...machineSnapshot,
-                skills: applySkillOverlayToCatalog(skills, skillOverlay, "codex"),
-              })),
-              Effect.mapError(
-                (cause) =>
-                  new ProviderDriverError({
-                    driver: DRIVER_KIND,
-                    instanceId,
-                    detail: `Failed to probe Codex skills for '${cwd}'`,
-                    cause,
-                  }),
+          : resolveCatalogSkillOverlay(resolveSkillOverlay, cwd, {
+              driver: DRIVER_KIND,
+              instanceId,
+            }).pipe(
+              Effect.flatMap((skillOverlay) =>
+                Effect.all([
+                  snapshot.getSnapshot,
+                  probeCodexSkillsForCwd({
+                    binaryPath: effectiveConfig.binaryPath,
+                    homePath: effectiveConfig.homePath,
+                    launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
+                    cwd,
+                    environment: processEnv,
+                  }).pipe(
+                    Effect.scoped,
+                    Effect.timeout("20 seconds"),
+                    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                  ),
+                ]).pipe(
+                  Effect.map(([machineSnapshot, skills]) => ({
+                    ...machineSnapshot,
+                    skills: applySkillOverlayToCatalog(skills, skillOverlay, "codex"),
+                  })),
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderDriverError({
+                        driver: DRIVER_KIND,
+                        instanceId,
+                        detail: `Failed to probe Codex skills for '${cwd}'`,
+                        cause,
+                      }),
+                  ),
+                ),
               ),
             );
 

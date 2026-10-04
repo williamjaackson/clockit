@@ -34,12 +34,16 @@ import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as Semaphore from "effect/Semaphore";
 
+import * as SkillLibrary from "../../skills/SkillLibrary.ts";
+import type { ProviderDriverError } from "../Errors.ts";
 import * as ModelManifest from "../ModelManifest.ts";
 import { applyProviderCompatibility } from "../providerCompatibility.ts";
 import * as ServerConfig from "../../config.ts";
@@ -343,6 +347,17 @@ export const ProviderRegistryLive = Layer.effect(
       PubSub.shutdown,
     );
 
+    // Skill library changes, buffered from before any snapshot is read. The
+    // forwarder starts immediately, so it subscribes before this layer does
+    // anything else; the handler below runs once everything it uses exists.
+    const skillLibrary = yield* Effect.serviceOption(SkillLibrary.SkillLibrary);
+    const skillLibraryChanges = yield* Queue.unbounded<SkillLibrary.SkillLibraryChange>();
+    if (Option.isSome(skillLibrary)) {
+      yield* Stream.runForEach(skillLibrary.value.streamChanges, (change) =>
+        Queue.offer(skillLibraryChanges, change),
+      ).pipe(Effect.forkScoped({ startImmediately: true }));
+    }
+
     // Boot-only: hydrate `providersRef` from the on-disk per-instance
     // cache so the UI has something to render during the first refresh.
     // Instances added post-boot skip this path; their first entry in
@@ -426,6 +441,12 @@ export const ProviderRegistryLive = Layer.effect(
     const workspaceRefreshesRef = yield* Ref.make<
       ReadonlyMap<ProviderInstance, ReadonlySet<string>>
     >(new Map());
+    // Counts skill library changes. A workspace scan that started before one
+    // scans again, so it never writes a catalog from before the change.
+    // The lock makes "drop snapshots and count" and "check count and write"
+    // happen one at a time.
+    const skillLibraryGenerationRef = yield* Ref.make(0);
+    const workspaceSnapshotLock = yield* Semaphore.make(1);
     const maintenanceActionStatesRef = yield* Ref.make<
       ReadonlyMap<ProviderInstanceId, { readonly update?: ServerProviderUpdateState | undefined }>
     >(new Map());
@@ -946,27 +967,50 @@ export const ProviderRegistryLive = Layer.effect(
             Effect.andThen(refreshInstance(input.instanceId)),
           )
         : Effect.void;
-      return yield* refreshMachineSnapshot.pipe(
-        Effect.andThen(instance.snapshotForCwd(input.cwd)),
-        Effect.flatMap((scopedSnapshot) =>
-          scopedSnapshot.status === "error" && scopedSnapshot.slashCommandsPending === undefined
-            ? Ref.get(providersRef)
-            : instanceRegistry.getInstance(input.instanceId).pipe(
-                Effect.flatMap((currentInstance) => {
-                  if (currentInstance !== instance) return Ref.get(providersRef);
-                  // Write only if the cwd's snapshot did not change during the
-                  // scan. A session event or another scan that landed first is newer.
-                  return updateProviders((currentProviders) =>
-                    currentProviders.map((candidate) =>
-                      candidate.instanceId === input.instanceId &&
-                      Equal.equals(workspaceSnapshotOf(candidate), scannedFrom)
-                        ? upsertProviderWorkspaceSnapshot(candidate, input.cwd, scopedSnapshot)
-                        : candidate,
-                    ),
-                  );
-                }),
+      const snapshotForCwd = instance.snapshotForCwd;
+      const scan = (): Effect.Effect<ReadonlyArray<ServerProvider>, ProviderDriverError> =>
+        Effect.gen(function* () {
+          const [generation, from] = yield* workspaceSnapshotLock.withPermits(1)(
+            Effect.all([
+              Ref.get(skillLibraryGenerationRef),
+              Ref.get(providersRef).pipe(
+                Effect.map((current) =>
+                  workspaceSnapshotOf(
+                    current.find((candidate) => candidate.instanceId === input.instanceId),
+                  ),
+                ),
               ),
-        ),
+            ]),
+          );
+          const scopedSnapshot = yield* snapshotForCwd(input.cwd);
+          if (
+            scopedSnapshot.status === "error" &&
+            scopedSnapshot.slashCommandsPending === undefined
+          ) {
+            return yield* Ref.get(providersRef);
+          }
+          if ((yield* instanceRegistry.getInstance(input.instanceId)) !== instance) {
+            return yield* Ref.get(providersRef);
+          }
+          const written = yield* workspaceSnapshotLock.withPermits(1)(
+            Effect.gen(function* () {
+              if ((yield* Ref.get(skillLibraryGenerationRef)) !== generation) return undefined;
+              // Write only if the cwd's snapshot did not change during the
+              // scan. A session event or another scan that landed first is newer.
+              return yield* updateProviders((currentProviders) =>
+                currentProviders.map((candidate) =>
+                  candidate.instanceId === input.instanceId &&
+                  Equal.equals(workspaceSnapshotOf(candidate), from)
+                    ? upsertProviderWorkspaceSnapshot(candidate, input.cwd, scopedSnapshot)
+                    : candidate,
+                ),
+              );
+            }),
+          );
+          return written ?? (yield* scan());
+        });
+      return yield* refreshMachineSnapshot.pipe(
+        Effect.andThen(scan()),
         Effect.ensuring(
           claimed
             ? Ref.update(workspaceRefreshesRef, (refreshes) => {
@@ -981,6 +1025,41 @@ export const ProviderRegistryLive = Layer.effect(
         ),
       );
     });
+
+    // A project change reaches that project, its subfolders, and every Git
+    // worktree sharing its profile; a global change reaches every workspace
+    // and each provider's own skill list. Workspace catalogs are few (capped
+    // per provider), so every one is dropped rather than mapped to the
+    // change: a composer showing one scans again, and others scan on next use.
+    const applySkillLibraryChange = (change: SkillLibrary.SkillLibraryChange) =>
+      Effect.gen(function* () {
+        yield* workspaceSnapshotLock.withPermits(1)(
+          updateProviders((providers) =>
+            providers.map((provider) => {
+              if (provider.workspaceSnapshots === undefined) return provider;
+              const { workspaceSnapshots: _workspaceSnapshots, ...machineSnapshot } = provider;
+              return machineSnapshot;
+            }),
+          ).pipe(Effect.andThen(Ref.update(skillLibraryGenerationRef, (count) => count + 1))),
+        );
+        if (change.projectRoot !== undefined) return;
+        const instances = yield* Ref.get(liveSubsRef);
+        yield* Effect.forEach(
+          instances.values(),
+          (instance) =>
+            (instance.invalidateCaches ?? Effect.void).pipe(
+              Effect.andThen(refreshOneSource(buildSnapshotSource(instance))),
+              Effect.ignoreCause({ log: true }),
+              Effect.forkIn(serviceScope),
+            ),
+          { discard: true },
+        );
+      });
+    yield* Queue.take(skillLibraryChanges).pipe(
+      Effect.flatMap(applySkillLibraryChange),
+      Effect.forever,
+      Effect.forkScoped,
+    );
 
     return {
       getProviders: Ref.get(providersRef),

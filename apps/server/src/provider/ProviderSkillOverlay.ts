@@ -7,10 +7,11 @@
  * to the repository or to any provider config file:
  *
  * - Repository skills the user disabled are switched off natively: Claude Code
- *   by name in flag-level `skillOverrides`, Codex by SKILL.md path in the
- *   thread's `skills.config`. Every private skill name is switched off the
- *   same way, by name in both, so a private copy is the only one the agent
- *   sees. A name rule also hides a user-level skill of that name.
+ *   by folder name (and frontmatter name) in flag-level `skillOverrides`,
+ *   Codex by SKILL.md path in the thread's `skills.config`. Every private
+ *   skill's invocation name is switched off too, by name in both, so a private
+ *   copy is the only one the agent sees. A name rule also hides a user-level
+ *   skill of that name.
  * - Private skills are not registered with either provider. T3 lists them in
  *   the agent's context with their SKILL.md paths, the lazy-loading contract
  *   native skills follow, and turns an explicit `$name` mention into an
@@ -20,6 +21,11 @@
  *   repository's instruction files (`claudeMdExcludes` rooted at the project,
  *   Codex `project_doc_max_bytes = 0`) while user-level files still load.
  *   `append` and `replace` add the private text to the agent's context.
+ *
+ * Claude Code merges flag-level settings into the user's own: verified in
+ * CLI 2.1.285, arrays such as `claudeMdExcludes` are unioned and objects such
+ * as `skillOverrides` merge by key, so the user's exclusions and overrides
+ * still apply.
  *
  * `prepareSkillOverlay` does the bounded filesystem reads once per use; the
  * builders below it are pure, so each provider's projection is testable.
@@ -35,10 +41,11 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import type * as Schema from "effect/Schema";
+import * as Schema from "effect/Schema";
 
 import * as SkillLibrary from "../skills/SkillLibrary.ts";
 import { parseSkillFrontmatter } from "./Drivers/ClaudeSkills.ts";
+import { ProviderDriverError } from "./Errors.ts";
 
 /** Private skills listed to the agent; more stay usable through `$name`. */
 const MAX_LISTED_SKILLS = 100;
@@ -46,12 +53,17 @@ const MAX_DESCRIPTION_CHARS = 300;
 /** Frontmatter sits at the top; a larger SKILL.md keeps its name only. */
 const MAX_FRONTMATTER_FILE_BYTES = 256_000;
 /** Codex's own default `project_doc_max_bytes`. Longer text points at the file. */
-const MAX_INSTRUCTION_CHARS = 32_000;
-/** Codex truncates one additional-context entry at about 1,000 tokens. */
-const CODEX_CONTEXT_CHUNK_CHARS = 3_000;
+const MAX_INSTRUCTION_BYTES = 32_768;
+/**
+ * Codex truncates one additional-context entry at about 1,000 tokens. A token
+ * covers at least one byte, so this bound holds for any script.
+ */
+const CODEX_CONTEXT_CHUNK_BYTES = 900;
 
 export interface OverlaySkill {
+  /** Frontmatter `name`, else the folder name: what `$name` and Codex use. */
   readonly name: string;
+  readonly folderName: string;
   readonly description: string | undefined;
   readonly directory: string;
   readonly skillFile: string;
@@ -68,10 +80,22 @@ export interface PreparedSkillOverlay {
   readonly skills: ReadonlyArray<OverlaySkill>;
   /** Repository skills the user disabled, resolved through symlinks when present. */
   readonly disabledRepoSkills: ReadonlyArray<{
+    /** Invocation name. */
     readonly name: string;
+    /** Folder name, which Claude Code names a skill by. */
+    readonly folderName: string;
     readonly directory: string;
     readonly skillFile: string;
   }>;
+  /**
+   * Native skills a private skill takes over: its invocation name, plus the
+   * folder names of repository copies. Kept even when the private SKILL.md
+   * could not be read, so the native copy stays off as the user asked.
+   */
+  readonly replaced: {
+    readonly names: ReadonlyArray<string>;
+    readonly folderNames: ReadonlyArray<string>;
+  };
   readonly instructions: {
     readonly mode: SkillProjectInstructionMode;
     readonly content: string | null;
@@ -79,8 +103,26 @@ export interface PreparedSkillOverlay {
   };
 }
 
-/** Never fails: an unreadable overlay applies nothing and is logged. */
-export type SkillOverlayResolver = (cwd: string) => Effect.Effect<PreparedSkillOverlay | undefined>;
+/**
+ * The project has private settings T3 could not read. Turns and catalogs
+ * fail with it rather than run with the user's switches silently lost.
+ */
+export class SkillOverlayError extends Schema.TaggedError<SkillOverlayError>()(
+  "SkillOverlayError",
+  {
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+/** `undefined` when the project has no private customization. */
+export type SkillOverlayResolver = (
+  cwd: string,
+) => Effect.Effect<PreparedSkillOverlay | undefined, SkillOverlayError>;
 
 export const prepareSkillOverlay = Effect.fn("prepareSkillOverlay")(function* (
   overlay: SkillLibrary.ProjectSkillOverlay,
@@ -89,20 +131,24 @@ export const prepareSkillOverlay = Effect.fn("prepareSkillOverlay")(function* (
   const path = yield* Path.Path;
 
   const skills: Array<OverlaySkill> = [];
+  const skipped: Array<string> = [];
   for (const skill of overlay.skills) {
     const skillFile = path.join(skill.path, "SKILL.md");
     const info = yield* fileSystem.stat(skillFile).pipe(Effect.orElseSucceed(() => undefined));
-    if (info?.type !== "File") continue;
     const contents =
-      Number(info.size) > MAX_FRONTMATTER_FILE_BYTES
+      info?.type !== "File" || Number(info.size) > MAX_FRONTMATTER_FILE_BYTES
         ? undefined
         : yield* fileSystem.readFileString(skillFile).pipe(Effect.orElseSucceed(() => undefined));
     const frontmatter = contents === undefined ? undefined : parseSkillFrontmatter(contents);
     // Claude Code refuses a skill whose frontmatter does not parse; so does T3.
-    if (frontmatter?.kind === "malformed") continue;
+    if (info?.type !== "File" || frontmatter?.kind === "malformed") {
+      skipped.push(skillFile);
+      continue;
+    }
     const parsed = frontmatter?.kind === "parsed" ? frontmatter : undefined;
     skills.push({
-      name: skill.name,
+      name: skill.invocationName ?? skill.name,
+      folderName: skill.name,
       description: parsed?.description,
       directory: skill.path,
       skillFile,
@@ -110,20 +156,39 @@ export const prepareSkillOverlay = Effect.fn("prepareSkillOverlay")(function* (
       modelInvocable: parsed?.userInvocationOnly !== true,
     });
   }
+  if (skipped.length > 0) {
+    yield* Effect.logWarning(
+      "Private project skills with an unreadable SKILL.md are not offered; their names stay switched off.",
+      { skipped },
+    );
+  }
 
   const disabledRepoSkills: Array<PreparedSkillOverlay["disabledRepoSkills"][number]> = [];
+  const replacedNames = new Set(overlay.skills.map((skill) => skill.invocationName ?? skill.name));
+  const replacedFolderNames = new Set<string>();
   for (const entry of overlay.suppressedRepoSkills) {
-    if (entry.reason !== "disabled" || entry.path === null) continue;
+    if (entry.reason === "replaced") {
+      replacedNames.add(entry.name);
+      if (entry.path !== null) {
+        replacedFolderNames.add(entry.folderName ?? path.basename(entry.path));
+      }
+      continue;
+    }
+    if (entry.path === null) continue;
     // Codex reports canonical paths; a missing folder keeps its stated path.
-    const directory = yield* fileSystem
-      .realPath(entry.path)
-      .pipe(Effect.orElseSucceed(() => entry.path!));
+    const stated = entry.path;
+    const directory = yield* fileSystem.realPath(stated).pipe(Effect.orElseSucceed(() => stated));
     disabledRepoSkills.push({
       name: entry.name,
+      folderName: entry.folderName ?? path.basename(stated),
       directory,
       skillFile: path.join(directory, "SKILL.md"),
     });
   }
+  const replaced = {
+    names: [...replacedNames].toSorted(),
+    folderNames: [...replacedFolderNames].toSorted(),
+  };
 
   const instructions = {
     mode: overlay.instructions.mode,
@@ -133,21 +198,31 @@ export const prepareSkillOverlay = Effect.fn("prepareSkillOverlay")(function* (
   const hash = NodeCrypto.createHash("sha256").update(overlay.projectRoot);
   for (const skill of skills) {
     hash.update(
-      `\0skill\0${skill.name}\0${skill.skillFile}\0${skill.description ?? ""}\0${skill.userInvocable}\0${skill.modelInvocable}`,
+      `\0skill\0${skill.name}\0${skill.folderName}\0${skill.skillFile}\0${skill.description ?? ""}\0${skill.userInvocable}\0${skill.modelInvocable}`,
     );
   }
   for (const skill of disabledRepoSkills) {
-    hash.update(`\0disabled\0${skill.name}\0${skill.skillFile}`);
+    hash.update(`\0disabled\0${skill.name}\0${skill.folderName}\0${skill.skillFile}`);
   }
+  hash.update(`\0replaced\0${replaced.names.join("\0")}\0\0${replaced.folderNames.join("\0")}`);
   hash.update(`\0instructions\0${instructions.mode}\0${instructions.path}\0`);
   if (instructions.content !== null) hash.update(instructions.content);
   const key = hash.digest("hex").slice(0, 16);
-  return { key, projectRoot: overlay.projectRoot, skills, disabledRepoSkills, instructions };
+  return {
+    key,
+    projectRoot: overlay.projectRoot,
+    skills,
+    disabledRepoSkills,
+    replaced,
+    instructions,
+  };
 });
 
 /**
- * Wrap the backend resolver for adapters: prepare the overlay and turn every
- * failure into "no overlay", so a broken private folder never fails a turn.
+ * Wrap the backend resolver for adapters and catalogs. A project without
+ * private settings resolves to `undefined`; a project whose settings cannot be
+ * read fails, because applying nothing would quietly re-enable the repository
+ * skills and instruction files the user switched off.
  */
 export function makeSkillOverlayResolver(
   library: Pick<SkillLibrary.SkillLibrary["Service"], "resolveProjectOverlay">,
@@ -155,23 +230,28 @@ export function makeSkillOverlayResolver(
 ): SkillOverlayResolver {
   return (cwd) =>
     library.resolveProjectOverlay(cwd).pipe(
+      Effect.mapError(
+        (cause) =>
+          new SkillOverlayError({
+            detail: `T3 could not read this project's private skill settings${
+              cause.path === undefined ? "" : ` at ${cause.path}`
+            } (${cause.detail}) and will not start the agent without them. Fix or remove that file, then try again.`,
+            cause,
+          }),
+      ),
       Effect.flatMap((overlay) =>
         Option.isNone(overlay) ? Effect.undefined : prepareSkillOverlay(overlay.value),
       ),
       Effect.provideService(FileSystem.FileSystem, services.fileSystem),
       Effect.provideService(Path.Path, services.path),
-      Effect.catch((cause) =>
-        Effect.logWarning("Could not resolve private project skills; applying none.", {
-          cwd,
-          cause,
-        }).pipe(Effect.as(undefined)),
-      ),
     );
 }
 
 /**
  * The resolver a driver hands its adapter, or `undefined` when this server
- * runs without a skill library, in which case nothing changes anywhere.
+ * runs without a skill library, in which case nothing changes anywhere. The
+ * production runtime provides the library to the instance registry, whose
+ * captured context every driver is created in.
  */
 export const skillOverlayResolverFromContext = Effect.gen(function* () {
   const library = yield* Effect.serviceOption(SkillLibrary.SkillLibrary);
@@ -181,6 +261,23 @@ export const skillOverlayResolverFromContext = Effect.gen(function* () {
   return makeSkillOverlayResolver(library.value, { fileSystem, path });
 });
 
+/**
+ * The overlay a workspace catalog applies. Unreadable settings fail the scan,
+ * so the catalog never lists switched-off skills as enabled.
+ */
+export const resolveCatalogSkillOverlay = (
+  resolver: SkillOverlayResolver | undefined,
+  cwd: string,
+  instance: { readonly driver: string; readonly instanceId: string },
+): Effect.Effect<PreparedSkillOverlay | undefined, ProviderDriverError> =>
+  resolver === undefined
+    ? Effect.undefined
+    : resolver(cwd).pipe(
+        Effect.mapError(
+          (error) => new ProviderDriverError({ ...instance, detail: error.detail, cause: error }),
+        ),
+      );
+
 const replacesRepositoryInstructions = (overlay: PreparedSkillOverlay) =>
   overlay.instructions.mode === "replace" || overlay.instructions.mode === "off";
 
@@ -189,10 +286,9 @@ function boundedInstructionText(overlay: PreparedSkillOverlay): string | undefin
   if ((mode !== "append" && mode !== "replace") || content === null || !content.trim()) {
     return undefined;
   }
+  const head = utf8Prefix(content, MAX_INSTRUCTION_BYTES);
   const body =
-    content.length > MAX_INSTRUCTION_CHARS
-      ? `${content.slice(0, MAX_INSTRUCTION_CHARS)}\n\n[Truncated. Read the rest from ${path}.]`
-      : content;
+    head.length < content.length ? `${head}\n\n[Truncated. Read the rest from ${path}.]` : content;
   const lead =
     mode === "replace"
       ? `These are this project's instructions, kept privately in T3 Code at ${path}. They replace the instruction files in the repository, which are not loaded. Follow them as you would an AGENTS.md file.`
@@ -261,15 +357,20 @@ export function privateSkillInvocationText(
     .join("\n");
 }
 
-/** Skill names Claude Code must not resolve natively in this project. */
+/**
+ * Skill names Claude Code must not resolve natively in this project. Claude
+ * Code names a skill by its folder, so a disabled or replaced repository
+ * skill is switched off by folder name; its frontmatter name is switched off
+ * too, so no spelling of it reaches the agent.
+ */
 export function claudeSuppressedSkillNames(
   overlay: PreparedSkillOverlay | undefined,
 ): ReadonlySet<string> {
   if (overlay === undefined) return new Set();
   return new Set([
-    ...overlay.skills.map((skill) => skill.name),
-    // Claude Code identifies a skill by its folder name.
-    ...overlay.disabledRepoSkills.map((skill) => skill.name),
+    ...overlay.replaced.names,
+    ...overlay.replaced.folderNames,
+    ...overlay.disabledRepoSkills.flatMap((skill) => [skill.folderName, skill.name]),
   ]);
 }
 
@@ -360,7 +461,8 @@ export function codexSkillOverlayThreadConfig(
 ): Readonly<Record<string, Schema.Json>> {
   const rules = [
     ...overlay.disabledRepoSkills.map((skill) => ({ path: skill.skillFile, enabled: false })),
-    ...overlay.skills.map((skill) => ({ name: skill.name, enabled: false })),
+    // Codex names a skill by its frontmatter `name`.
+    ...overlay.replaced.names.map((name) => ({ name, enabled: false })),
   ];
   return {
     ...(rules.length === 0 ? {} : { "skills.config": rules }),
@@ -370,16 +472,39 @@ export function codexSkillOverlayThreadConfig(
   };
 }
 
+const utf8Length = (codePoint: number) =>
+  codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4;
+
+/** The longest whole-character prefix of `text` within `maxBytes` of UTF-8. */
+function utf8Prefix(text: string, maxBytes: number): string {
+  let bytes = 0;
+  let end = 0;
+  for (const char of text) {
+    bytes += utf8Length(char.codePointAt(0)!);
+    if (bytes > maxBytes) break;
+    end += char.length;
+  }
+  return text.slice(0, end);
+}
+
+/**
+ * Split under the per-entry byte bound, at a line break in the back half of
+ * a chunk when there is one, and never inside a character.
+ */
 function chunk(text: string): ReadonlyArray<string> {
   const chunks: Array<string> = [];
   let rest = text;
-  while (rest.length > CODEX_CONTEXT_CHUNK_CHARS) {
-    const cut = rest.lastIndexOf("\n", CODEX_CONTEXT_CHUNK_CHARS);
-    const end = cut > CODEX_CONTEXT_CHUNK_CHARS / 2 ? cut : CODEX_CONTEXT_CHUNK_CHARS;
+  while (rest.length > 0) {
+    const head = utf8Prefix(rest, CODEX_CONTEXT_CHUNK_BYTES);
+    if (head.length === rest.length) {
+      chunks.push(rest);
+      break;
+    }
+    const cut = head.lastIndexOf("\n");
+    const end = cut > head.length / 2 ? cut : head.length;
     chunks.push(rest.slice(0, end));
     rest = rest.slice(end).replace(/^\n/, "");
   }
-  if (rest.length > 0) chunks.push(rest);
   return chunks;
 }
 
@@ -412,11 +537,16 @@ export function applySkillOverlayToCatalog(
   provider: "claudeAgent" | "codex",
 ): ReadonlyArray<ServerProviderSkill> {
   if (overlay === undefined) return skills;
-  const privateNames = new Set(overlay.skills.map((skill) => skill.name));
+  // Claude Code lists skills by folder name, Codex by frontmatter name.
+  const replaced = new Set(
+    provider === "claudeAgent"
+      ? [...overlay.replaced.names, ...overlay.replaced.folderNames]
+      : overlay.replaced.names,
+  );
   const claudeOff = claudeSuppressedSkillNames(overlay);
   const codexOffPaths = new Set(overlay.disabledRepoSkills.map((skill) => skill.skillFile));
   const native = skills.flatMap((skill) => {
-    if (privateNames.has(skill.name)) return [];
+    if (replaced.has(skill.name)) return [];
     const off =
       provider === "claudeAgent" ? claudeOff.has(skill.name) : codexOffPaths.has(skill.path);
     return [off ? { ...skill, enabled: false } : skill];

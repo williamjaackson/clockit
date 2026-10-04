@@ -17,6 +17,7 @@ import {
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   applySkillOverlayToCatalog,
+  resolveCatalogSkillOverlay,
   skillOverlayResolverFromContext,
 } from "../ProviderSkillOverlay.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
@@ -277,30 +278,31 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
     auth: runtime.auth.controller,
     snapshotForCwd: (cwd: string) =>
       enabled
-        ? resolveRuntime.pipe(
-            Effect.flatMap((effective) =>
-              probeCodexSkillsForCwd({
-                binaryPath: effective.config.binaryPath,
-                homePath: effective.config.homePath,
-                launchArgs: effective.config.launchArgs,
-                cwd,
-                environment: effective.environment,
-              }),
-            ),
-            Effect.flatMap((skills) =>
-              Effect.all([
-                snapshot.getSnapshot,
-                resolveSkillOverlay === undefined ? Effect.undefined : resolveSkillOverlay(cwd),
-              ]).pipe(
-                Effect.map(([draft, skillOverlay]) => ({
-                  ...draft,
-                  skills: applySkillOverlayToCatalog(skills, skillOverlay, "codex"),
-                })),
+        ? resolveCatalogSkillOverlay(resolveSkillOverlay, cwd, { driver: DRIVER, instanceId }).pipe(
+            Effect.flatMap((skillOverlay) =>
+              resolveRuntime.pipe(
+                Effect.flatMap((effective) =>
+                  probeCodexSkillsForCwd({
+                    binaryPath: effective.config.binaryPath,
+                    homePath: effective.config.homePath,
+                    launchArgs: effective.config.launchArgs,
+                    cwd,
+                    environment: effective.environment,
+                  }),
+                ),
+                Effect.flatMap((skills) =>
+                  snapshot.getSnapshot.pipe(
+                    Effect.map((draft) => ({
+                      ...draft,
+                      skills: applySkillOverlayToCatalog(skills, skillOverlay, "codex"),
+                    })),
+                  ),
+                ),
+                Effect.scoped,
+                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                Effect.catch(() => snapshot.getSnapshot),
               ),
             ),
-            Effect.scoped,
-            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-            Effect.catch(() => snapshot.getSnapshot),
           )
         : snapshot.getSnapshot,
   } satisfies ProviderInstance;

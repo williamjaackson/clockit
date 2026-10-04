@@ -58,6 +58,7 @@ export function SkillDetailRouteScreen({
   const [files, setFiles] = useState<{ list: readonly string[]; truncated: boolean } | null>(null);
   const [filesError, setFilesError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const leavingRef = useRef(false);
   const { environmentId, entryId } = params;
 
   useEffect(() => {
@@ -93,8 +94,12 @@ export function SkillDetailRouteScreen({
   }
 
   const isProjectPrivate = snapshot.scope.kind === "project" && snapshot.scope.mode !== "shared";
+  const isShared = snapshot.scope.kind === "project" && snapshot.scope.mode === "shared";
   const canToggle = entry.ownership === "managed" || isProjectPrivate;
-  const showLinks = entry.ownership === "managed" && entry.scope === "global" && entry.enabled;
+  // Shared snapshots only list links for skills kept directly in `.agents/skills`.
+  const showLinks =
+    (entry.ownership === "managed" && entry.scope === "global" && entry.enabled) ||
+    (isShared && entry.links.length > 0);
 
   const toggleEnabled = async (enabled: boolean) => {
     setPending(true);
@@ -126,11 +131,14 @@ export function SkillDetailRouteScreen({
       "Could not archive the skill",
     );
     setPending(false);
-    if (result !== null) navigation.goBack();
+    if (result === null) return;
+    leavingRef.current = true;
+    navigation.goBack();
   };
 
   return (
     <SettingsScreen title={entry.name}>
+      <SkillsDiscardGuard dirty={false} saving={pending} leavingRef={leavingRef} />
       <ScrollView
         contentInsetAdjustmentBehavior="automatic"
         showsVerticalScrollIndicator={false}
@@ -208,9 +216,10 @@ export function SkillDetailRouteScreen({
         ) : null}
 
         {showLinks && entry.links.length > 0 ? (
-          <SettingsSection title="Provider links">
+          <SettingsSection title={isShared ? "Repository links" : "Provider links"}>
             <SkillLinkRows
               environmentId={environmentId}
+              scope={scope}
               subject={{ type: "skill", name: entry.name }}
               subjectLabel={entry.name}
               links={entry.links}
@@ -222,6 +231,12 @@ export function SkillDetailRouteScreen({
               }
             />
           </SettingsSection>
+        ) : null}
+        {showLinks && isShared ? (
+          <SkillsNote>
+            Claude Code reads .claude/skills, not .agents/skills. Linking adds a relative symlink to
+            the repository so both read this folder. Nothing is linked until you ask.
+          </SkillsNote>
         ) : null}
 
         <SettingsSection title="Files">

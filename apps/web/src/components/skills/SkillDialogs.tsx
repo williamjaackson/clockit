@@ -30,6 +30,7 @@ export function NewSkillDialog(props: {
   readonly environmentId: EnvironmentId;
   readonly scope: SkillScope;
   readonly snapshot: SkillsSnapshot;
+  /** Runs after the skill exists. The dialog can't close while the request is in flight. */
   readonly onCreated: (snapshot: SkillsSnapshot, name: string) => void;
 }) {
   const save = useAtomCommand(skillsEnvironment.save, { reportFailure: false });
@@ -41,6 +42,7 @@ export function NewSkillDialog(props: {
   const canCreate = nameError === null && description.trim().length > 0 && !pending;
 
   const close = () => {
+    if (pending) return;
     setName("");
     setDescription("");
     setTouched(false);
@@ -66,8 +68,11 @@ export function NewSkillDialog(props: {
     );
     setPending(false);
     if (result === null) return;
+    setName("");
+    setDescription("");
+    setTouched(false);
+    props.onOpenChange(false);
     props.onCreated(result.snapshot, trimmed);
-    close();
   };
 
   return (
@@ -119,7 +124,7 @@ export function NewSkillDialog(props: {
           </form>
         </DialogPanel>
         <DialogFooter variant="bare">
-          <Button variant="outline" onClick={close}>
+          <Button variant="outline" disabled={pending} onClick={close}>
             Cancel
           </Button>
           <Button disabled={!canCreate} onClick={() => void create()}>
@@ -141,6 +146,7 @@ export function ImportSkillDialog(props: {
   readonly environmentId: EnvironmentId;
   readonly scope: SkillScope;
   readonly snapshot: SkillsSnapshot;
+  /** Runs after the copy exists. The dialog can't close while the request is in flight. */
   readonly onImported: (snapshot: SkillsSnapshot, name: string) => void;
 }) {
   const entry = props.entry;
@@ -174,12 +180,17 @@ export function ImportSkillDialog(props: {
     );
     setPending(false);
     if (result === null) return;
-    props.onImported(result.snapshot, result.name);
     props.onOpenChange(false);
+    props.onImported(result.snapshot, result.name);
   };
 
   return (
-    <Dialog open onOpenChange={props.onOpenChange}>
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !pending) props.onOpenChange(false);
+      }}
+    >
       <DialogPopup className="max-w-md">
         <DialogHeader>
           <DialogTitle>Import {entry.name}</DialogTitle>
@@ -234,7 +245,7 @@ export function ImportSkillDialog(props: {
           </form>
         </DialogPanel>
         <DialogFooter variant="bare">
-          <Button variant="outline" onClick={() => props.onOpenChange(false)}>
+          <Button variant="outline" disabled={pending} onClick={() => props.onOpenChange(false)}>
             Cancel
           </Button>
           <Button disabled={nameError !== null || pending} onClick={() => void submit()}>

@@ -20,6 +20,7 @@ import * as ProjectSetupScriptRunner from "../../../project/ProjectSetupScriptRu
 import * as ProviderRegistry from "../../../provider/Services/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
+import * as SkillLibrary from "../../../skills/SkillLibrary.ts";
 import * as VcsStatusBroadcaster from "../../../vcs/VcsStatusBroadcaster.ts";
 import * as McpHttpServer from "../../McpHttpServer.ts";
 import * as McpSessionRegistry from "../../McpSessionRegistry.ts";
@@ -38,6 +39,7 @@ const StubServicesLive = Layer.mergeAll(
   Layer.mock(GitWorkflowService.GitWorkflowService)({}),
   Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({}),
   Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({}),
+  Layer.mock(SkillLibrary.SkillLibrary)({}),
 );
 
 const ToolsListPayload = Schema.fromJsonString(
@@ -61,7 +63,7 @@ const ToolsListPayload = Schema.fromJsonString(
 );
 const decodeToolsListPayload = Schema.decodeUnknownEffect(ToolsListPayload);
 
-it.effect("production mcp layer lists worktree tools over http", () =>
+it.effect("production mcp layer lists worktree and skills tools over http", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const routes = McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer));
@@ -134,6 +136,34 @@ it.effect("production mcp layer lists worktree tools over http", () =>
       const status = tools.find((tool) => tool.name === "t3_worktree_status");
       expect(status?.annotations?.readOnlyHint).toBe(true);
       expect(status?.annotations?.destructiveHint).toBe(false);
+
+      // Skills tools read the server's own SkillLibrary; only reads are read-only.
+      const skillTools = tools.filter((tool) => tool.name.startsWith("t3_skills_"));
+      expect(skillTools.map((tool) => tool.name).toSorted()).toEqual([
+        "t3_skills_archive",
+        "t3_skills_delete_recovery",
+        "t3_skills_import",
+        "t3_skills_import_instructions",
+        "t3_skills_link",
+        "t3_skills_list",
+        "t3_skills_read",
+        "t3_skills_read_instructions",
+        "t3_skills_restore",
+        "t3_skills_save",
+        "t3_skills_save_instructions",
+        "t3_skills_set_enabled",
+        "t3_skills_unlink",
+        "t3_skills_update_project_settings",
+      ]);
+      for (const tool of skillTools) {
+        const readOnly = [
+          "t3_skills_list",
+          "t3_skills_read",
+          "t3_skills_read_instructions",
+        ].includes(tool.name);
+        expect(tool.annotations?.readOnlyHint, tool.name).toBe(readOnly);
+        expect(tool.annotations?.destructiveHint, tool.name).toBe(!readOnly);
+      }
 
       // MCP requires every tool input schema to be a top-level object schema.
       // A non-object schema (e.g. the anyOf produced by an empty

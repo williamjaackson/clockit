@@ -1,11 +1,12 @@
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import type { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import {
+  findScopeLibraryEntry,
   newSkillContent,
   scopeLibraryNames,
   validateNewSkillName,
 } from "@t3tools/client-runtime/state/skills";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -21,7 +22,7 @@ import { SettingsSwitchRow } from "../settings/components/SettingsSwitchRow";
 import { runSkillsCommand } from "./skills-commands";
 import { SkillsNote } from "./skills-components";
 import type { SkillsRoutes } from "./skills-routes";
-import { useSkillsScope } from "./skills-screen-state";
+import { SkillsDiscardGuard, useSkillsScope } from "./skills-screen-state";
 
 function FormField(props: {
   readonly label: string;
@@ -66,6 +67,7 @@ export function SkillNewRouteScreen({
   const navigation = useNavigation<NativeStackNavigationProp<SkillsRoutes>>();
   const { scope, view } = useSkillsScope(params);
   const save = useAtomCommand(skillsEnvironment.save, { reportFailure: false });
+  const leavingRef = useRef(false);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [pending, setPending] = useState(false);
@@ -93,15 +95,20 @@ export function SkillNewRouteScreen({
     );
     setPending(false);
     if (result === null) return;
-    const created = result.snapshot.entries.find(
-      (entry) => entry.ownership === "managed" && entry.name === trimmed,
-    );
+    // The guard below kept this screen in place, so it still belongs to `params`.
+    leavingRef.current = true;
+    const created = findScopeLibraryEntry(result.snapshot, trimmed);
     if (created) navigation.replace("SettingsSkill", { ...params, entryId: created.id });
     else navigation.goBack();
   };
 
   return (
     <SettingsScreen title="New skill">
+      <SkillsDiscardGuard
+        dirty={name.trim().length > 0 || description.trim().length > 0}
+        saving={pending}
+        leavingRef={leavingRef}
+      />
       <ScrollView
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
@@ -153,6 +160,7 @@ export function SkillImportRouteScreen({
   const navigation = useNavigation<NativeStackNavigationProp<SkillsRoutes>>();
   const { scope, view } = useSkillsScope(params);
   const importSkill = useAtomCommand(skillsEnvironment.import, { reportFailure: false });
+  const leavingRef = useRef(false);
   const entry = view.snapshot?.entries.find((candidate) => candidate.id === params.entryId) ?? null;
   const [name, setName] = useState(entry?.name ?? "");
   const [adopt, setAdopt] = useState(false);
@@ -194,15 +202,15 @@ export function SkillImportRouteScreen({
     );
     setPending(false);
     if (result === null) return;
-    const imported = result.snapshot.entries.find(
-      (candidate) => candidate.ownership === "managed" && candidate.name === result.name,
-    );
+    leavingRef.current = true;
+    const imported = findScopeLibraryEntry(result.snapshot, result.name);
     if (imported) navigation.replace("SettingsSkill", { ...params, entryId: imported.id });
     else navigation.goBack();
   };
 
   return (
     <SettingsScreen title={`Import ${entry.name}`}>
+      <SkillsDiscardGuard dirty={false} saving={pending} leavingRef={leavingRef} />
       <ScrollView
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"

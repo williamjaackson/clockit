@@ -1,7 +1,7 @@
 # Skills and instructions
 
-Open **Skills** from the sidebar, next to Usage, or from the command palette. On mobile it is in
-**Settings**, right after Usage. Bind `skills.open` in **Settings → Keybindings** if you want a
+Open **Skills** from the sidebar, next to Usage, from the command palette, or from the **Skills**
+button on **Settings → Providers**. On mobile it is in **Settings**, right after Usage. Bind `skills.open` in **Settings → Keybindings** if you want a
 shortcut. It has no default.
 
 Each environment keeps its own skills. Pick the environment at the top of the page, then pick
@@ -37,12 +37,18 @@ same text.
 ## Project skills
 
 A project opens in **Private to T3**. Changes are stored outside the repository and apply only to
-agents you run in T3 Code. Terminal agents and teammates don't see them, and support differs by
-provider:
+Claude Code and Codex agents you run in T3 Code. Terminal agents, teammates, and other providers
+don't see them.
 
-- Claude Code applies private skills, disabled skills, and instructions.
-- Codex applies disabled skills and instructions to new threads. It can't load private skills yet.
-- Other providers ignore private changes for now.
+- T3 lists your private skills to the agent with the path of each `SKILL.md`, and the agent reads
+  the file when a task matches. Mentioning one with `$name` tells the agent to use it.
+- A private skill switches off any repository or user skill with the same name, so the agent only
+  sees your copy. Turning a repository skill off works the same way.
+- Claude Code picks up changes on its next turn. Codex picks up new private skills and instructions
+  on its next turn, but turning a skill off only takes effect in a new thread or after the thread
+  reloads.
+- Private skills are plain files to the agent, so provider-only frontmatter such as
+  `allowed-tools` or `context: fork` may not apply.
 
 For private instructions, choose whether they add to the repository's `AGENTS.md` or `CLAUDE.md`,
 replace them, or turn project instructions off.
@@ -50,6 +56,12 @@ replace them, or turn project instructions off.
 Switch to **Repository files** to edit the project's own skill folders, `AGENTS.md`, and
 `CLAUDE.md`. These edits change files in the checkout, so terminal agents and teammates see them
 once you commit. T3 asks once per project before the first switch.
+
+Claude Code doesn't read `.agents/skills` or `AGENTS.md`. Under **Repository links**, link a skill
+into `.claude/skills` or turn `CLAUDE.md` into a link to `AGENTS.md`, so every tool reads the same
+files. T3 adds relative symlinks you can commit, and only when you ask: saving or creating a skill
+never links it. If something already sits at the path, T3 names it and asks before moving it to
+Recovery.
 
 ## Recovery
 
@@ -60,4 +72,6 @@ puts an item back. Delete removes it for good.
 
 If a file changed on disk after you opened it, saving stops and keeps your draft. Copy what you
 need, then reload the file. T3 asks before discarding unsaved edits when you switch skills,
-projects, or environments.
+projects, or environments, refresh, or enable, disable, or archive the skill you're editing. If the
+skill, project, or environment disappears while you have unsaved edits, the editor stays open so
+you can copy them.

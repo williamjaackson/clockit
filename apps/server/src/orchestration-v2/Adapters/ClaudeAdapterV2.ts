@@ -936,7 +936,13 @@ export function makeClaudeQueryOptions(input: {
   return input.cwd === null ? withDirectories : { ...withDirectories, cwd: input.cwd };
 }
 
-/** Flag-level settings for a project's private skills and instructions. */
+const CLAUDE_SKILL_OVERLAY_PENDING_NOTICE =
+  "This project's skill or instruction settings changed. Claude picks them up once its background work finishes; this turn uses the previous setup.";
+
+/**
+ * Flag-level settings for a project's private skills and instructions. Claude
+ * Code merges them with the user's settings files rather than replacing them.
+ */
 function claudeOverlayQueryOptions(
   settings: Extract<ClaudeSkillOverlayQuery, { readonly _tag: "Applied" }>["settings"],
 ): { readonly sdkSettings?: ClaudeSdkSettings } {
@@ -2779,7 +2785,9 @@ interface ClaudeLiveQueryContext {
   readonly queryPolicyKey: string;
   readonly selectionKey: string;
   // Private project skills and instructions this process was opened with.
-  readonly skillOverlayKey: string | null;
+  // Every prompt it takes uses this overlay, even after the project's
+  // changes, until the process reopens.
+  readonly skillOverlay: PreparedSkillOverlay | undefined;
   readonly closed: Deferred.Deferred<void, never>;
   // Whether this CLI process echoes a prompt's uuid on the first frame of
   // the turn answering it ("early") or only on its result. Learned from the
@@ -3046,7 +3054,15 @@ export function makeClaudeAdapterV2(
   const resolveSkillOverlay = (cwd: string | null) =>
     cwd === null || adapterOptions.resolveSkillOverlay === undefined
       ? Effect.succeed<PreparedSkillOverlay | undefined>(undefined)
-      : adapterOptions.resolveSkillOverlay(cwd);
+      : adapterOptions.resolveSkillOverlay(cwd).pipe(
+          Effect.mapError(
+            (error) =>
+              new ProviderAdapter.ProviderAdapterProtocolError({
+                driver: CLAUDE_PROVIDER,
+                detail: error.detail,
+              }),
+          ),
+        );
 
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: adapterOptions.instanceId,
@@ -3753,6 +3769,38 @@ export function makeClaudeAdapterV2(
             context.itemOrdinals.set(nativeItemId, ordinal);
             return ordinal;
           });
+
+        const emitSkillOverlayPendingNotice = Effect.fnUntraced(function* (
+          context: ActiveClaudeTurnContext,
+        ) {
+          const now = yield* DateTime.now;
+          const nativeItemId = `skill-overlay-pending:${context.providerTurnId}`;
+          yield* emitProviderEvent({
+            type: "turn_item.updated",
+            driver: CLAUDE_PROVIDER,
+            turnItem: {
+              id: idAllocator.derive.turnItemFromProviderItem({
+                driver: CLAUDE_PROVIDER,
+                nativeItemId,
+              }),
+              threadId: context.input.threadId,
+              runId: context.input.runId,
+              nodeId: context.input.rootNodeId,
+              providerThreadId: context.input.providerThread.id,
+              providerTurnId: context.providerTurnId,
+              nativeItemRef: { driver: CLAUDE_PROVIDER, nativeId: nativeItemId, strength: "weak" },
+              parentItemId: null,
+              ordinal: yield* resolveItemOrdinal(context, nativeItemId),
+              type: "system_notice",
+              status: "completed",
+              title: CLAUDE_SKILL_OVERLAY_PENDING_NOTICE,
+              message: CLAUDE_SKILL_OVERLAY_PENDING_NOTICE,
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+            },
+          });
+        });
 
         const providerTurnPayload = (input: {
           readonly context: ActiveClaudeTurnContext;
@@ -7002,7 +7050,7 @@ export function makeClaudeAdapterV2(
             // Changed private skills or instructions reopen the process, but
             // never under running background work: they wait for a turn
             // that can reopen it safely.
-            (existing.skillOverlayKey === skillOverlayKey ||
+            ((existing.skillOverlay?.key ?? null) === skillOverlayKey ||
               (!existing.stopping && (yield* liveProcessRunsBackgroundWork(existing))))
           ) {
             // Claude can switch its own mode mid-session (EnterPlanMode), and
@@ -7137,7 +7185,7 @@ export function makeClaudeAdapterV2(
             query: querySession,
             queryPolicyKey,
             selectionKey: compiledSelection.queryIdentity,
-            skillOverlayKey,
+            skillOverlay,
             closed,
             promptEchoMode: "unknown",
             openedPermissionMode: queryOptions.permissionMode,
@@ -7262,13 +7310,13 @@ export function makeClaudeAdapterV2(
             // follow live. The continuation prompt text never reaches the CLI.
             const isContinuationTurn = context.promptUuid === null;
             const skillOverlay = yield* resolveSkillOverlay(turnInput.runtimePolicy.cwd);
-            const privateSkillText = privateSkillInvocationText(
-              turnInput.message.text,
-              skillOverlay,
-            );
-            const userMessage = isContinuationTurn
-              ? null
-              : yield* makeClaudeUserMessageWithAttachments({
+            const makeUserMessage = (overlay: PreparedSkillOverlay | undefined) =>
+              Effect.gen(function* () {
+                const privateSkillText = privateSkillInvocationText(
+                  turnInput.message.text,
+                  overlay,
+                );
+                return yield* makeClaudeUserMessageWithAttachments({
                   text: applyClaudePromptEffortPrefix(
                     turnInput.message.text,
                     compileClaudeModelSelection(turnInput.modelSelection).promptEffort,
@@ -7276,14 +7324,20 @@ export function makeClaudeAdapterV2(
                   attachments: turnInput.message.attachments,
                   attachmentsDir,
                   fileSystem,
-                  skillNames: yield* userInvocableSkillNames(
-                    turnInput.runtimePolicy.cwd,
-                    skillOverlay,
-                  ),
+                  skillNames: yield* userInvocableSkillNames(turnInput.runtimePolicy.cwd, overlay),
                   ...(privateSkillText === undefined ? {} : { privateSkillText }),
                   uuid: claudePromptUuid(turnInput.attemptId),
                 });
+              });
+            // Built before opening, so a bad attachment never opens a process.
+            let userMessage = isContinuationTurn ? null : yield* makeUserMessage(skillOverlay);
             const querySession = yield* openQuery(turnInput, nativeThreadId, skillOverlay);
+            // Background work kept the process opened with an older overlay.
+            // The prompt follows what that process applies, not what it will.
+            const overlayPending = querySession.skillOverlay?.key !== skillOverlay?.key;
+            if (overlayPending && userMessage !== null) {
+              userMessage = yield* makeUserMessage(querySession.skillOverlay);
+            }
             yield* Ref.set(activeTurn, context);
             yield* emitProviderEvent({
               type: "provider_turn.updated",
@@ -7294,6 +7348,9 @@ export function makeClaudeAdapterV2(
                 completedAt: null,
               }),
             });
+            if (overlayPending && userMessage !== null) {
+              yield* emitSkillOverlayPendingNotice(context);
+            }
             if (userMessage !== null) {
               // A user turn that races a wake leaves the buffer alone: the
               // continuation run the worker queued behind this run drains it
@@ -7481,7 +7538,8 @@ export function makeClaudeAdapterV2(
                 detail: `Claude provider turn ${turnInput.providerTurnId} is not the active turn.`,
               });
             }
-            const skillOverlay = yield* resolveSkillOverlay(currentTurn.input.runtimePolicy.cwd);
+            // A steer joins the live process, so it uses that process's overlay.
+            const skillOverlay = existing.skillOverlay;
             const privateSkillText = privateSkillInvocationText(
               turnInput.message.text,
               skillOverlay,
