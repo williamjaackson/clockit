@@ -449,6 +449,8 @@ function involvementParams(input: {
       return [["author_username", input.viewer]];
     case "reviewing":
       return [["reviewer_username", input.viewer]];
+    case "assigned":
+      return [["assignee_username", input.viewer]];
     case "all":
       return [];
   }

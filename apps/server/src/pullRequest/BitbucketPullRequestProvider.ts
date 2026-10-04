@@ -164,25 +164,29 @@ export const make = Effect.gen(function* () {
     // account is the same whichever workspace asks.
     getViewer: () => api.getViewer().pipe(Effect.mapError(fail("getViewer"))),
 
+    // Bitbucket pull requests have reviewers but no assignees, so an assigned listing is empty
+    // without asking the host.
     listChangeRequests: (input) =>
-      api
-        .listPullRequests({
-          repository: input.repository,
-          state: input.state,
-          limit: input.limit,
-          query: input.query,
-          cursor: input.cursor,
-        })
-        .pipe(
-          Effect.mapError(fail("listChangeRequests")),
-          Effect.map((batch) => ({
-            items: batch.items.map(toChangeRequest),
-            truncated: batch.truncated,
-            // Bitbucket is asked for `-updated_on` whether or not it is being carried on from,
-            // so every page it answers is one a cursor can continue.
-            continues: true,
-          })),
-        ),
+      input.involvement === "assigned"
+        ? Effect.succeed({ items: [], truncated: false, continues: true })
+        : api
+            .listPullRequests({
+              repository: input.repository,
+              state: input.state,
+              limit: input.limit,
+              query: input.query,
+              cursor: input.cursor,
+            })
+            .pipe(
+              Effect.mapError(fail("listChangeRequests")),
+              Effect.map((batch) => ({
+                items: batch.items.map(toChangeRequest),
+                truncated: batch.truncated,
+                // Bitbucket is asked for `-updated_on` whether or not it is being carried on from,
+                // so every page it answers is one a cursor can continue.
+                continues: true,
+              })),
+            ),
 
     getChangeRequestChecks: (input) =>
       Effect.all([api.getPullRequest(input), api.listChecks(input)], { concurrency: 2 }).pipe(

@@ -12,7 +12,7 @@ import {
 } from "./baseSchemas.ts";
 import { SourceControlProviderKind } from "./sourceControl.ts";
 
-export const PullRequestInvolvement = Schema.Literals(["all", "reviewing", "authored"]);
+export const PullRequestInvolvement = Schema.Literals(["all", "reviewing", "authored", "assigned"]);
 export type PullRequestInvolvement = typeof PullRequestInvolvement.Type;
 
 export const PullRequestState = Schema.Literals(["open", "closed", "merged"]);
@@ -530,6 +530,12 @@ export const PullRequestListEntry = Schema.Struct({
   /** Server epoch milliseconds when the provider read started; preserved on cache hits. */
   observedAt: Schema.optional(Schema.Finite),
   viewerReviewRequested: Schema.Boolean,
+  /**
+   * The signed-in account is one of the change request's assignees. Set independently of review
+   * requests, so a row can carry both. Absent means not assigned, which is what a server too old
+   * to know and a host without assignees both send.
+   */
+  viewerAssigned: Schema.optional(Schema.Boolean),
   labels: Schema.Array(PullRequestLabel),
   /** Absent where the host does not summarise its reviews, which is every host but GitHub. */
   reviewDecision: Schema.optional(PullRequestReviewDecision),

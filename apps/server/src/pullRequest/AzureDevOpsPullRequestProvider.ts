@@ -305,28 +305,32 @@ export const make = Effect.gen(function* () {
     // `input.query` is deliberately dropped: `az repos pr list` filters by status, creator,
     // reviewer and branch, and has nothing that matches text. Sending it as one of those would
     // narrow by the wrong thing, so the page comes back unnarrowed and the caller filters it.
+    // Azure pull requests have reviewers but no assignees, so an assigned listing is empty
+    // without asking the host.
     listChangeRequests: (input) =>
-      cli
-        .listPullRequests({
-          cwd: input.cwd,
-          repository: input.repository,
-          state: input.state,
-          involvement: input.involvement,
-          viewer: input.viewer,
-          limit: input.limit,
-          cursor: input.cursor,
-        })
-        .pipe(
-          Effect.mapError(fail("listChangeRequests")),
-          Effect.map((batch) => ({
-            items: batch.items.map(toChangeRequest),
-            truncated: batch.truncated,
-            cursorAdvance: batch.cursorAdvance,
-            // Azure answers in one order whether or not it is being carried on from, so a slice
-            // can always be stepped past — by counting, which is all Azure offers.
-            continues: true,
-          })),
-        ),
+      input.involvement === "assigned"
+        ? Effect.succeed({ items: [], truncated: false, continues: true })
+        : cli
+            .listPullRequests({
+              cwd: input.cwd,
+              repository: input.repository,
+              state: input.state,
+              involvement: input.involvement,
+              viewer: input.viewer,
+              limit: input.limit,
+              cursor: input.cursor,
+            })
+            .pipe(
+              Effect.mapError(fail("listChangeRequests")),
+              Effect.map((batch) => ({
+                items: batch.items.map(toChangeRequest),
+                truncated: batch.truncated,
+                cursorAdvance: batch.cursorAdvance,
+                // Azure answers in one order whether or not it is being carried on from, so a slice
+                // can always be stepped past — by counting, which is all Azure offers.
+                continues: true,
+              })),
+            ),
 
     // The polled path a linked thread's row stays live on: one `az` read, no iterations or
     // changes behind it, since the file count that would cost is not shown here.

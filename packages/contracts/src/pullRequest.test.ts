@@ -97,6 +97,18 @@ describe("PullRequestListResult", () => {
     expect(decoded).toStrictEqual(LIST_RESULT);
   });
 
+  it("carries the assignment flag, and reads a row from an older server without it", () => {
+    const [entry] = LIST_RESULT.entries;
+    const codec = Schema.toCodecJson(PullRequestListResult);
+    const assigned = { ...LIST_RESULT, entries: [{ ...entry!, viewerAssigned: true }] };
+
+    expect(
+      Schema.decodeSync(codec)(Schema.encodeUnknownSync(codec)(assigned)).entries[0]
+        ?.viewerAssigned,
+    ).toBe(true);
+    expect(decodeListResult(LIST_RESULT).entries[0]?.viewerAssigned).toBeUndefined();
+  });
+
   it("keys a viewer by host, so two hosts of one kind stay separate accounts", () => {
     const decoded = decodeListResult({
       ...LIST_RESULT,
@@ -111,6 +123,12 @@ describe("PullRequestListResult", () => {
 describe("PullRequestListInput", () => {
   it("trims a search, so what is sent is what was typed", () => {
     expect(decodeListInput({ state: "open", query: "  page  " }).query).toBe("page");
+  });
+
+  it("asks for the viewer's assignments", () => {
+    expect(decodeListInput({ state: "open", involvement: "assigned" }).involvement).toBe(
+      "assigned",
+    );
   });
 
   it("has no search when none was asked for", () => {

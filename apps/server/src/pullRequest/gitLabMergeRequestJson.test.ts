@@ -80,6 +80,20 @@ describe("decodeMergeRequestListJson", () => {
     });
   });
 
+  it("reads assignees apart from reviewers", () => {
+    const batch = expectSuccess(
+      decodeMergeRequestListJson(
+        listJson([
+          { assignees: [{ username: "Bilal" }, { username: "hubot" }], reviewers: [] },
+          { reviewers: [{ username: "bilal" }] },
+        ]),
+      ),
+    );
+
+    expect(batch.items.map((item) => item.assigneeLogins)).toEqual([["Bilal", "hubot"], []]);
+    expect(batch.items[1]?.reviewRequestLogins).toEqual(["bilal"]);
+  });
+
   it("reports no line counts, which GitLab does not expose", () => {
     const batch = expectSuccess(decodeMergeRequestListJson(listJson([{}])));
 

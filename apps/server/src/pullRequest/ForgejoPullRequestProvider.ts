@@ -1,7 +1,11 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Result from "effect/Result";
-import type { PullRequestCapabilities, PullRequestViewerPermissions } from "@t3tools/contracts";
+import type {
+  PullRequestCapabilities,
+  PullRequestListState,
+  PullRequestViewerPermissions,
+} from "@t3tools/contracts";
 import { decodeJsonResult } from "@t3tools/shared/schemaJson";
 import * as ForgejoCli from "../sourceControl/ForgejoCli.ts";
 import { parseDiffFileRevisions } from "./bitbucketDiffRevisions.ts";
@@ -12,6 +16,7 @@ import {
   type PullRequestProviderApi,
 } from "./PullRequestProvider.ts";
 import {
+  ForgejoIssue,
   ForgejoPullRequest,
   ForgejoRepository,
   ForgejoUser,
@@ -59,6 +64,8 @@ const pullPath = (input: ProviderRepositoryRef & { readonly number: number }) =>
   `${repoPath(input)}/pulls/${input.number}`;
 const issuePath = (input: ProviderRepositoryRef & { readonly number: number }) =>
   `${repoPath(input)}/issues/${input.number}`;
+// Forgejo files merged pull requests under closed.
+const listingState = (state: PullRequestListState) => (state === "merged" ? "closed" : state);
 // Review IDs differ from the issue-comment IDs used by Forgejo's reactions API.
 const reviewCommentId = (review: typeof ForgejoReview.Type) =>
   /#issuecomment-([1-9]\d*)$/.exec(review.html_url ?? "")?.[1];
@@ -146,6 +153,37 @@ export const make = Effect.gen(function* () {
     }
     return { items, truncated: true };
   });
+  /**
+   * Up to `limit` rows of a paged listing, starting `offset` rows in. `consumed` counts null rows
+   * too, so the caller's cursor steps past them.
+   */
+  const readFrom = Effect.fn("ForgejoPullRequestProvider.readFrom")(function* <A>(
+    input: ForgejoCli.ForgejoApiInput,
+    schema: Schema.Codec<A, unknown, never, never>,
+    offset: number,
+    limit: number,
+  ) {
+    // Self-hosted servers may cap pages below 50. Establish their actual page size before
+    // translating the service's row offset into an API page number.
+    const first = yield* readPage(input, Schema.NullOr(schema), 1);
+    const pageSize = first.rows.length || 50;
+    const firstIndex = Math.floor(offset / pageSize) + 1;
+    const rows: A[] = [];
+    let consumed = 0;
+    let more = true;
+    for (let index = firstIndex; more && consumed < limit; index++) {
+      const result = index === 1 ? first : yield* readPage(input, Schema.NullOr(schema), index);
+      const start = index === firstIndex ? offset % pageSize : 0;
+      const countBefore = consumed;
+      for (const row of result.rows.slice(start)) {
+        if (consumed >= limit) break;
+        consumed++;
+        if (row) rows.push(row);
+      }
+      more = result.more || result.rows.length - start > consumed - countBefore;
+    }
+    return { rows, consumed, more };
+  });
   const write = (input: ForgejoCli.ForgejoApiInput) => request(input).pipe(Effect.asVoid);
   const getPull = (input: ProviderRepositoryRef & { readonly number: number }) =>
     read(
@@ -200,6 +238,40 @@ export const make = Effect.gen(function* () {
     );
     return permissions(repo, pr, viewer);
   });
+  /**
+   * The pulls listing cannot filter by assignee, but the issues listing can and answers pull
+   * requests with `type=pulls`. Each match is then read as a pull request for the row's fields.
+   */
+  const listAssigned = Effect.fn("ForgejoPullRequestProvider.listAssigned")(function* (
+    input: Parameters<PullRequestProviderApi["listChangeRequests"]>[0],
+  ) {
+    const wanted = (state: string) => input.state === "all" || state === input.state;
+    const query = {
+      ...input,
+      path: `${repoPath(input)}/issues?type=pulls&state=${listingState(input.state)}&sort=recentupdate&assigned_by=${encodeURIComponent(input.viewer)}`,
+    };
+    const offset = input.cursor?.delivered ?? 0;
+    const items: ReturnType<typeof forgejoChangeRequest>[] = [];
+    let consumed = 0;
+    let more: boolean;
+    // A slice the state filter empties is read past, since the service takes an empty page for
+    // the end of the listing.
+    do {
+      const slice = yield* readFrom(query, ForgejoIssue, offset + consumed, input.limit);
+      consumed += slice.consumed;
+      more = slice.more;
+      const numbers = slice.rows.flatMap((issue) => {
+        const merged = issue.pull_request?.merged;
+        const state = issue.state === "open" ? "open" : merged ? "merged" : "closed";
+        return merged === undefined || wanted(state) ? [issue.number] : [];
+      });
+      const pulls = yield* Effect.forEach(numbers, (number) => getPull({ ...input, number }), {
+        concurrency: 4,
+      });
+      items.push(...pulls.map(forgejoChangeRequest).filter((item) => wanted(item.state)));
+    } while (more && items.length === 0);
+    return { items, truncated: more, continues: true, cursorAdvance: consumed };
+  });
   const unsupported = (operation: string) =>
     Effect.fail(failure(operation, `Forgejo does not expose ${operation} through its API.`));
   const provider: PullRequestProviderApi = {
@@ -208,34 +280,22 @@ export const make = Effect.gen(function* () {
     getViewer,
     listChangeRequests: Effect.fn("ForgejoPullRequestProvider.listChangeRequests")(
       function* (input) {
-        const offset = input.cursor?.delivered ?? 0;
-        const items: ReturnType<typeof forgejoChangeRequest>[] = [];
-        const state = input.state === "merged" ? "closed" : input.state;
-        const query = {
-          ...input,
-          path: `${repoPath(input)}/pulls?state=${state}&sort=recentupdate`,
+        if (input.involvement === "assigned") return yield* listAssigned(input);
+        const slice = yield* readFrom(
+          {
+            ...input,
+            path: `${repoPath(input)}/pulls?state=${listingState(input.state)}&sort=recentupdate`,
+          },
+          ForgejoPullRequest,
+          input.cursor?.delivered ?? 0,
+          input.limit,
+        );
+        return {
+          items: slice.rows.map(forgejoChangeRequest),
+          truncated: slice.more,
+          continues: true,
+          cursorAdvance: slice.consumed,
         };
-        // Self-hosted servers may cap pages below 50. Establish their actual page size before
-        // translating the service's row offset into an API page number.
-        const first = yield* readPage(query, Schema.NullOr(ForgejoPullRequest), 1);
-        const pageSize = first.rows.length || 50;
-        const firstIndex = Math.floor(offset / pageSize) + 1;
-        let consumed = 0;
-        let more = true;
-        for (let index = firstIndex; more && consumed < input.limit; index++) {
-          const result =
-            index === 1 ? first : yield* readPage(query, Schema.NullOr(ForgejoPullRequest), index);
-          const rows = result.rows;
-          const start = index === firstIndex ? offset % pageSize : 0;
-          const countBefore = consumed;
-          for (const row of rows.slice(start)) {
-            if (consumed >= input.limit) break;
-            consumed++;
-            if (row) items.push(forgejoChangeRequest(row));
-          }
-          more = result.more || rows.length - start > consumed - countBefore;
-        }
-        return { items, truncated: more, continues: true, cursorAdvance: consumed };
       },
     ),
     getChangeRequestSummary: (input) => getPull(input).pipe(Effect.map(forgejoChangeRequest)),

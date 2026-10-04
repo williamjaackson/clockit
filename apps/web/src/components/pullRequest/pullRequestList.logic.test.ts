@@ -359,6 +359,37 @@ describe("pull request involvement filtering", () => {
       filterPullRequestsByInvolvement(mixed, VIEWERS, "authored").map((item) => item.number),
     ).toEqual([1]);
   });
+
+  it("uses the server-computed assignment flag for Assigned, whoever wrote or reviews it", () => {
+    const assignment = [
+      entry({ number: 1, viewerAssigned: true }),
+      entry({
+        number: 2,
+        author: { login: "Bilal", name: null, avatarUrl: null },
+        viewerAssigned: true,
+      }),
+      entry({ number: 3, viewerReviewRequested: true, viewerAssigned: true }),
+      entry({ number: 4, viewerReviewRequested: true, viewerAssigned: false }),
+      // A row from a server too old to send the flag is not assigned.
+      entry({ number: 5, author: { login: "Bilal", name: null, avatarUrl: null } }),
+    ];
+    expect(
+      filterPullRequestsByInvolvement(assignment, VIEWERS, "assigned").map((item) => item.number),
+    ).toEqual([1, 2, 3]);
+  });
+
+  it("keeps the viewer's own pull requests under Authored whoever they are assigned to", () => {
+    const mine = { login: "Bilal", name: null, avatarUrl: null };
+    const assignment = [
+      entry({ number: 1, author: mine, viewerAssigned: true }),
+      // Assigned to somebody else, which the server reports as not assigned to the viewer.
+      entry({ number: 2, author: mine, viewerAssigned: false }),
+      entry({ number: 3, viewerAssigned: true }),
+    ];
+    expect(
+      filterPullRequestsByInvolvement(assignment, VIEWERS, "authored").map((item) => item.number),
+    ).toEqual([1, 2]);
+  });
 });
 
 describe("pull request grouping", () => {
@@ -393,6 +424,38 @@ describe("pull request grouping", () => {
       VIEWERS,
     );
     expect(groups.map((group) => group.key)).toEqual(["authored"]);
+  });
+
+  it("files each pull request once, assigned above authored above review-requested", () => {
+    const mine = { login: "bilal", name: null, avatarUrl: null };
+    const groups = groupPullRequestsByInvolvement(
+      [
+        entry({ number: 1, author: mine, viewerReviewRequested: true, viewerAssigned: true }),
+        entry({ number: 2, author: mine, viewerAssigned: false }),
+        entry({ number: 3, viewerAssigned: true }),
+        entry({ number: 4, viewerReviewRequested: true }),
+        entry({ number: 5, viewerReviewRequested: true, viewerAssigned: true }),
+        entry({ number: 6 }),
+      ],
+      VIEWERS,
+    );
+    expect(
+      groups.map((group) => [group.key, group.label, group.entries.map((item) => item.number)]),
+    ).toEqual([
+      ["assigned", "Assigned to you", [1, 3, 5]],
+      ["authored", "Authored", [2]],
+      ["reviewRequested", "Review requested", [4]],
+      ["others", "Others", [6]],
+    ]);
+  });
+
+  it("files an assigned pull request under Assigned even when the viewer is unknown", () => {
+    // Assignment is the server's own answer, so it does not wait on knowing who "I" am here.
+    const groups = groupPullRequestsByInvolvement(
+      [entry({ number: 1, viewerAssigned: true }), entry({ number: 2 })],
+      NO_VIEWERS,
+    );
+    expect(groups.map((group) => group.key)).toEqual(["assigned", "others"]);
   });
 });
 
@@ -979,6 +1042,27 @@ describe("blocked-on-me ranking", () => {
       groups,
     );
   });
+
+  it("ranks assigned work as the viewer's own to land, in its group and on its tab", () => {
+    // A conflict waits on whoever owns the pull request; a reviewer ranking would leave it be.
+    const assigned = [
+      entry({ number: 1, updatedAt: "2026-08-02T00:00:00Z" }),
+      entry({ number: 2, mergeability: "conflicting" }),
+    ];
+    const group = { key: "assigned", label: "Assigned to you", entries: assigned } as const;
+    const others = { key: "others", label: "", entries: assigned } as const;
+
+    expect(
+      sortPullRequestGroups([group], "blocked", "", undefined, "all")[0]!.entries.map(
+        (row) => row.number,
+      ),
+    ).toEqual([2, 1]);
+    expect(
+      sortPullRequestGroups([others], "blocked", "", undefined, "assigned")[0]!.entries.map(
+        (row) => row.number,
+      ),
+    ).toEqual([2, 1]);
+  });
 });
 
 describe("line counts that arrive after the rows", () => {
@@ -1080,6 +1164,170 @@ describe("partitioning with the hosts' own priority reads", () => {
     const groups = partitionPullRequestsWithPriority([fresh], [stale], []);
     expect(groups[0]!.entries[0]!.title).toBe("Retitled");
   });
+
+  it("puts an older assigned row the feed has not reached at the top, in its own group", () => {
+    const shown = entry({ number: 1, updatedAt: "2026-07-06T00:00:00Z" });
+    const olderAssigned = entry({
+      number: 9,
+      updatedAt: "2026-01-01T00:00:00Z",
+      viewerAssigned: true,
+    });
+    const groups = partitionPullRequestsWithPriority([shown], [], [], [olderAssigned]);
+    expect(
+      groups.map((group) => [group.key, group.label, group.entries.map((item) => item.number)]),
+    ).toEqual([
+      ["assigned", "Assigned to you", [9]],
+      ["others", "Others", [1]],
+    ]);
+  });
+
+  it("shows a row in every partition once, under Assigned, and keeps the rest in priority order", () => {
+    const everywhere = entry({
+      number: 1,
+      updatedAt: "2026-07-01T00:00:00Z",
+      author: { login: "Bilal", name: null, avatarUrl: null },
+      viewerReviewRequested: true,
+      viewerAssigned: true,
+    });
+    const assignedNewer = entry({
+      number: 2,
+      updatedAt: "2026-07-03T00:00:00Z",
+      viewerAssigned: true,
+    });
+    const mine = authoredRow(3, "2026-07-02T00:00:00Z");
+    const requested = entry({
+      number: 4,
+      updatedAt: "2026-07-02T00:00:00Z",
+      viewerReviewRequested: true,
+    });
+    const other = entry({ number: 5, updatedAt: "2026-07-04T00:00:00Z" });
+    const groups = partitionPullRequestsWithPriority(
+      // The feed carries copies of partitioned rows too; none of them may land in Others.
+      [other, assignedNewer, everywhere, mine],
+      [everywhere, mine],
+      [everywhere, requested],
+      [everywhere, assignedNewer],
+    );
+    expect(groups.map((group) => [group.key, group.entries.map((item) => item.number)])).toEqual([
+      ["assigned", [2, 1]],
+      ["authored", [3]],
+      ["reviewRequested", [4]],
+      ["others", [5]],
+    ]);
+  });
+
+  it("files a row from the assigned read by its own flag rather than by the read it came from", () => {
+    const mine = entry({ number: 1, viewerAssigned: true });
+    const theirs = entry({ number: 2 });
+    const groups = partitionPullRequestsWithPriority([mine, theirs], [], [], [mine, theirs]);
+    expect(groups.map((group) => [group.key, group.entries.map((item) => item.number)])).toEqual([
+      ["assigned", [1]],
+      ["others", [2]],
+    ]);
+  });
+
+  it("lets the feed's copy of an assigned row replace the partition's", () => {
+    const stale = entry({ number: 1, viewerAssigned: true });
+    const fresh = { ...stale, title: "Retitled" };
+    const groups = partitionPullRequestsWithPriority([fresh], [], [], [stale]);
+    expect(groups.map((group) => group.key)).toEqual(["assigned"]);
+    expect(groups[0]!.entries[0]!.title).toBe("Retitled");
+  });
+
+  const keyed = (groups: ReturnType<typeof partitionPullRequestsWithPriority>) =>
+    groups.map((group) => [group.key, group.entries.map((item) => item.number)]);
+
+  it("moves a feed row assigned since the assigned read answered up into Assigned", () => {
+    const handedOver = entry({
+      number: 1,
+      updatedAt: "2026-07-06T00:00:00Z",
+      viewerAssigned: true,
+      observedAt: 200,
+    });
+    const other = entry({ number: 2, updatedAt: "2026-07-07T00:00:00Z", observedAt: 200 });
+    const groups = partitionPullRequestsWithPriority([other, handedOver], [], [], []);
+    expect(keyed(groups)).toEqual([
+      ["assigned", [1]],
+      ["others", [2]],
+    ]);
+  });
+
+  it("moves a feed row assigned since the assigned read answered out of Authored", () => {
+    const held = authoredRow(1, "2026-07-01T00:00:00Z");
+    const handedOver = { ...held, viewerAssigned: true, observedAt: 200 };
+    const groups = partitionPullRequestsWithPriority([handedOver], [held], [], []);
+    expect(keyed(groups)).toEqual([["assigned", [1]]]);
+  });
+
+  it("files a row unassigned since the assigned read under the next group that holds it", () => {
+    const stale = (number: number, overrides: Partial<EnvironmentPullRequestEntry> = {}) =>
+      entry({ number, viewerAssigned: true, observedAt: 100, ...overrides });
+    const mine = stale(1, { author: { login: "Bilal", name: null, avatarUrl: null } });
+    const requested = stale(2, { viewerReviewRequested: true });
+    const theirs = stale(3);
+    // Absent and false both read as no longer assigned.
+    const unassignedMine = { ...mine, viewerAssigned: false, observedAt: 200 };
+    const { viewerAssigned: _, ...unassignedRequested }: EnvironmentPullRequestEntry = {
+      ...requested,
+      observedAt: 200,
+    };
+    const unassignedTheirs = { ...theirs, viewerAssigned: false, observedAt: 200 };
+    const groups = partitionPullRequestsWithPriority(
+      [unassignedMine, unassignedRequested, unassignedTheirs],
+      [mine],
+      [requested],
+      [mine, requested, theirs],
+    );
+    expect(keyed(groups)).toEqual([
+      ["authored", [1]],
+      ["reviewRequested", [2]],
+      ["others", [3]],
+    ]);
+    expect(groups.flatMap((group) => group.entries).map((item) => item.observedAt)).toEqual([
+      200, 200, 200,
+    ]);
+  });
+
+  it("keeps a newer assigned copy over an older feed copy that predates the assignment", () => {
+    const older = entry({ number: 1, observedAt: 100, title: "Before" });
+    const newer = { ...older, viewerAssigned: true, observedAt: 200, title: "After" };
+    const groups = partitionPullRequestsWithPriority([older], [], [], [newer]);
+    expect(keyed(groups)).toEqual([["assigned", [1]]]);
+    expect(groups[0]!.entries[0]!.title).toBe("After");
+  });
+
+  it("does not carry one environment's assignment to the same pull request in another", () => {
+    const assignedHere = entry({ number: 1, viewerAssigned: true, observedAt: 100 });
+    const elsewhere = entry({
+      number: 1,
+      environmentId: "env-2" as EnvironmentId,
+      observedAt: 200,
+    });
+    const groups = partitionPullRequestsWithPriority([elsewhere], [], [], [assignedHere]);
+    expect(
+      groups.map((group) => [group.key, group.entries.map((item) => item.environmentId)]),
+    ).toEqual([
+      ["assigned", ["env-1"]],
+      ["others", ["env-2"]],
+    ]);
+  });
+
+  it("keeps an older assigned row the feed has not reached while the feed gains new ones", () => {
+    const olderAssigned = entry({
+      number: 9,
+      updatedAt: "2026-01-01T00:00:00Z",
+      viewerAssigned: true,
+      observedAt: 100,
+    });
+    const newlyAssigned = entry({
+      number: 1,
+      updatedAt: "2026-07-06T00:00:00Z",
+      viewerAssigned: true,
+      observedAt: 200,
+    });
+    const groups = partitionPullRequestsWithPriority([newlyAssigned], [], [], [olderAssigned]);
+    expect(keyed(groups)).toEqual([["assigned", [1, 9]]]);
+  });
 });
 
 describe("the list snapshot across a reload", () => {
@@ -1180,6 +1428,36 @@ describe("the list snapshot across a reload", () => {
     expect(snapshot?.data.entries).toHaveLength(99);
     expect(snapshot?.data.viewers).toEqual(viewers);
     expect(snapshot?.data.providers).toEqual(providers);
+  });
+
+  it("brings the assigned partition back with the other two", () => {
+    const storage = makeStorage();
+    writePullRequestListSnapshot(storage, "env-1", {
+      scope: "s",
+      data,
+      partitions: {
+        authored: [entry({ number: 2 })],
+        reviewing: [entry({ number: 3, viewerReviewRequested: true })],
+        assigned: [entry({ number: 4, viewerAssigned: true })],
+      },
+    });
+    const partitions = readPullRequestListSnapshot(storage, "env-1")?.partitions;
+    expect(partitions?.assigned?.map((item) => [item.number, item.viewerAssigned])).toEqual([
+      [4, true],
+    ]);
+    expect(partitions?.authored.map((item) => item.number)).toEqual([2]);
+  });
+
+  it("still hydrates a snapshot written before there was an assigned partition", () => {
+    const storage = makeStorage();
+    writePullRequestListSnapshot(storage, "env-1", {
+      scope: "s",
+      data,
+      partitions: { authored: [entry({ number: 2 })], reviewing: [] },
+    });
+    const snapshot = readPullRequestListSnapshot(storage, "env-1");
+    expect(snapshot?.partitions?.authored.map((item) => item.number)).toEqual([2]);
+    expect(snapshot?.partitions?.assigned).toBeUndefined();
   });
 });
 

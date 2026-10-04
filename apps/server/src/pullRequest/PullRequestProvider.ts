@@ -95,6 +95,8 @@ export interface ProviderChangeRequest {
   readonly updatedAt: string;
   /** Accounts with a review requested. Team-level requests are excluded by each provider. */
   readonly reviewRequestLogins: ReadonlyArray<string>;
+  /** Accounts the change request is assigned to. Absent from a host that has no assignees. */
+  readonly assigneeLogins?: ReadonlyArray<string> | undefined;
   readonly labels: ReadonlyArray<PullRequestLabel>;
   /** Absent from a host that does not summarise its reviews, which is every host but GitHub. */
   readonly reviewDecision?: PullRequestReviewDecision | null | undefined;
