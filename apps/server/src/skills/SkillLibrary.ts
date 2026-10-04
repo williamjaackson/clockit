@@ -997,9 +997,9 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const existing = yield* existingProfile(projectRoot);
       if (existing !== undefined) return existing;
-      return (yield* profileLocations(projectRoot))
-        .filter((location) => location.activeRoot === projectRoot)
-        .at(-1)!;
+      return (yield* profileLocations(projectRoot)).findLast(
+        (location) => location.activeRoot === projectRoot,
+      )!;
     });
 
   const resolveScope = (scope: SkillScope) =>

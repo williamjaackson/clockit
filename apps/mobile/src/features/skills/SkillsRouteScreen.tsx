@@ -12,6 +12,7 @@ import {
   GLOBAL_SKILLS_SCOPE,
   PRIVATE_PROJECT_SUPPORT_NOTICE,
   providerDisplayName,
+  sharedProfileNotice,
   SKILL_ENTRY_FILTERS,
   skillScope,
   skillsFailureMessage,
@@ -100,6 +101,7 @@ export function SkillsRouteScreen() {
       : skillsEnvironment.view({ environmentId, scope }),
   );
   const snapshot = view.snapshot;
+  const profileNotice = snapshot === null ? null : sharedProfileNotice(snapshot.scope);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<SkillEntryFilter>("all");
   const entries = useMemo(
@@ -382,11 +384,16 @@ export function SkillsRouteScreen() {
                 detail={snapshot?.scope.projectRoot ?? project.workspaceRoot}
               />
             ) : (
-              <SkillsNote>
-                Stored outside the repository
-                {snapshot !== null ? ` in ${snapshot.scope.libraryPath}` : ""}.{" "}
-                {PRIVATE_PROJECT_SUPPORT_NOTICE}
-              </SkillsNote>
+              <>
+                {profileNotice !== null ? (
+                  <SkillsWarning title="Inherited private settings" detail={profileNotice} />
+                ) : null}
+                <SkillsNote>
+                  Stored outside the repository
+                  {snapshot !== null ? ` in ${snapshot.scope.libraryPath}` : ""}.{" "}
+                  {PRIVATE_PROJECT_SUPPORT_NOTICE}
+                </SkillsNote>
+              </>
             )}
           </View>
         ) : null}

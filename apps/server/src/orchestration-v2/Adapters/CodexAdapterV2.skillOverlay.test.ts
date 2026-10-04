@@ -20,8 +20,12 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
-import type { PreparedSkillOverlay } from "../../provider/ProviderSkillOverlay.ts";
+import {
+  type PreparedSkillOverlay,
+  SkillOverlayError,
+} from "../../provider/ProviderSkillOverlay.ts";
 import * as IdAllocator from "../IdAllocator.ts";
 import {
   ProviderAdapterV2RuntimePolicy,
@@ -45,6 +49,7 @@ const overlayFor = (
   skills: [
     {
       name: "review",
+      folderName: "review",
       description: "Review with house rules",
       directory: `/t3${projectRoot}/skills/review`,
       skillFile: `/t3${projectRoot}/skills/review/SKILL.md`,
@@ -55,10 +60,12 @@ const overlayFor = (
   disabledRepoSkills: [
     {
       name: "deploy",
+      folderName: "deploy",
       directory: `${projectRoot}/.agents/skills/deploy`,
       skillFile: `${projectRoot}/.agents/skills/deploy/SKILL.md`,
     },
   ],
+  replaced: { names: ["review"], folderNames: [] },
   instructions: {
     mode: input.mode ?? "inherit",
     content: input.mode === "replace" ? `Rules for ${projectRoot}.` : null,
@@ -350,22 +357,95 @@ describe("CodexAdapterV2 private project skills", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
-  it.effect("drops the overrides and context once the overlay is cleared", () =>
+  it.effect("keeps a loaded thread's overlay until it reloads, and says so once", () =>
     Effect.gen(function* () {
       let current: PreparedSkillOverlay | undefined = overlayFor("/work/app");
       const harness = yield* makeHarness({ resolveSkillOverlay: () => current });
       const thread = yield* harness.openThread("/work/app");
       yield* thread.startTurn("one");
-      assert.property(harness.last("turn/start").params, "additionalContext");
+      const loadedContext = harness.last("turn/start").params.additionalContext;
+      assert.isDefined(loadedContext);
 
+      // Codex still applies the loaded skills.config, so the turn keeps the
+      // private context that matches it instead of claiming the change.
       current = undefined;
       yield* thread.resume;
+      yield* thread.startTurn("two");
+      assert.deepEqual(harness.last("turn/start").params.additionalContext, loadedContext);
+      yield* thread.startTurn("three please $review");
+      const steeredInput = harness.last("turn/start").params.input as ReadonlyArray<{
+        readonly text?: string;
+      }>;
+      assert.isTrue(
+        steeredInput.some((item) => item.text?.includes("/t3/work/app/skills/review/SKILL.md")),
+      );
+      yield* thread.startTurn("four");
+
+      const events = yield* thread.runtime.events.pipe(
+        Stream.takeUntil(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.ordinal === 4 &&
+            event.providerTurn.status === "running",
+        ),
+        Stream.runCollect,
+      );
+      const notices = events.flatMap((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "system_notice"
+          ? [event.turnItem]
+          : [],
+      );
+      assert.equal(notices.length, 1);
+      assert.include(notices[0]!.message, "Codex applies them to new threads");
+
+      // A thread loaded after the change gets the new setup.
+      const fresh = yield* makeHarness({ resolveSkillOverlay: () => current });
+      const freshThread = yield* fresh.openThread("/work/app");
       assert.deepEqual(
-        harness.last("thread/resume").params.config,
+        fresh.last("thread/start").params.config,
         CodexAdapterV2.CODEX_THREAD_CONFIG,
       );
-      yield* thread.startTurn("two");
-      assert.notProperty(harness.last("turn/start").params, "additionalContext");
+      yield* freshThread.startTurn("five");
+      assert.notProperty(fresh.last("turn/start").params, "additionalContext");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("fails the turn when the project's private settings cannot be read", () =>
+    Effect.gen(function* () {
+      const requests: Array<RecordedRequest> = [];
+      const fake = makeFakeClient(requests);
+      const adapter = CodexAdapterV2.makeCodexAdapterV2({
+        instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+        settings: DEFAULT_SETTINGS,
+        environment: {},
+        clientFactory: { open: () => Effect.succeed(fake.client) },
+        fileSystem: yield* FileSystem.FileSystem,
+        idAllocator: yield* IdAllocator.IdAllocatorV2,
+        serverConfig: yield* makeReplayServerConfig("skill-overlay-error").pipe(Effect.orDie),
+        resolveSkillOverlay: () =>
+          Effect.fail(new SkillOverlayError({ detail: "Manifest unreadable; fix it." })),
+      });
+      const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: "/work/app",
+      });
+      const runtime = yield* adapter.openSession({
+        threadId: ThreadId.make("thread-error"),
+        providerSessionId: ProviderSessionId.make("session-error"),
+        modelSelection: MODEL_SELECTION,
+        runtimePolicy,
+      });
+      const exit = yield* Effect.exit(
+        runtime.ensureThread({
+          threadId: ThreadId.make("thread-error"),
+          modelSelection: MODEL_SELECTION,
+          runtimePolicy,
+        }),
+      );
+      assert.isTrue(Exit.isFailure(exit));
+      assert.include(String(Exit.isFailure(exit) ? exit.cause : ""), "Manifest unreadable");
+      assert.isUndefined(requests.find((request) => request.method === "thread/start"));
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

@@ -1594,13 +1594,7 @@ it.layer(NodeServices.layer)("SkillLibrary", (it) => {
             NodeCrypto.createHash("sha256").update(worktree).digest("hex").slice(0, 16),
             "manifest.json",
           ),
-          JSON.stringify({
-            version: 1,
-            projectRoot: worktree,
-            disabledRepoSkills: [],
-            instructionMode: "off",
-            globalInstructionsEnabled: true,
-          }),
+          `{"version":1,"projectRoot":"${worktree}","disabledRepoSkills":[],"instructionMode":"off","globalInstructionsEnabled":true}`,
         );
         const { listed: legacy, overlay } = yield* expectSameProfile(world, app);
         expect(legacy.scope).toMatchObject({ profileRoot: worktree, profileSource: "project" });

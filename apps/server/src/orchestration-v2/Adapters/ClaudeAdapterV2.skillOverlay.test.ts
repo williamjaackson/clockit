@@ -25,7 +25,11 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
-import type { PreparedSkillOverlay } from "../../provider/ProviderSkillOverlay.ts";
+import {
+  type PreparedSkillOverlay,
+  SkillOverlayError,
+  type SkillOverlayResolver,
+} from "../../provider/ProviderSkillOverlay.ts";
 import * as IdAllocator from "../IdAllocator.ts";
 import {
   ProviderAdapterV2RuntimePolicy,
@@ -76,6 +80,7 @@ const privateOverlay = (
   skills: [
     {
       name: "review",
+      folderName: "review",
       description: "Review with house rules",
       directory: `${privateRoot}/review`,
       skillFile: `${privateRoot}/review/SKILL.md`,
@@ -86,10 +91,12 @@ const privateOverlay = (
   disabledRepoSkills: [
     {
       name: "deploy",
+      folderName: "deploy",
       directory: `${projectRoot}/.claude/skills/deploy`,
       skillFile: `${projectRoot}/.claude/skills/deploy/SKILL.md`,
     },
   ],
+  replaced: { names: ["review"], folderNames: [] },
   instructions: {
     mode: input.mode ?? "inherit",
     content: input.mode === "replace" ? "Private rule: use tabs." : null,
@@ -101,9 +108,7 @@ const privateOverlay = (
  * One adapter with a scripted query runner. Each opened query gets its own
  * message queue; `finish` ends the turn running on the latest one.
  */
-const makeHarness = (
-  resolveSkillOverlay: ((cwd: string) => PreparedSkillOverlay | undefined) | undefined,
-) =>
+const makeHarness = (resolveSkillOverlay: SkillOverlayResolver | undefined) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -135,9 +140,7 @@ const makeHarness = (
       fileSystem,
       path,
       idAllocator,
-      ...(resolveSkillOverlay === undefined
-        ? {}
-        : { resolveSkillOverlay: (cwd: string) => Effect.sync(() => resolveSkillOverlay(cwd)) }),
+      ...(resolveSkillOverlay === undefined ? {} : { resolveSkillOverlay }),
       queryRunner: {
         allocateSessionId: Effect.succeed(NATIVE_SESSION),
         open: (input) =>
@@ -180,10 +183,16 @@ const makeHarness = (
           runtimePolicy,
         });
         const terminals = yield* Queue.unbounded<ProviderAdapterV2Event>();
+        // Filled by the same consumer before each terminal, so a test reads
+        // it after `runTurn` returns.
+        const notices: Array<string> = [];
         yield* runtime.events.pipe(
-          Stream.runForEach((event) =>
-            event.type === "turn.terminal" ? Queue.offer(terminals, event) : Effect.void,
-          ),
+          Stream.runForEach((event) => {
+            if (event.type === "turn_item.updated" && event.turnItem.type === "system_notice") {
+              notices.push(event.turnItem.message);
+            }
+            return event.type === "turn.terminal" ? Queue.offer(terminals, event) : Effect.void;
+          }),
           Effect.forkScoped,
         );
         let ordinal = 0;
@@ -244,6 +253,7 @@ const makeHarness = (
         return {
           runtime,
           runTurn,
+          notices,
           startTurn: (text: string) => runtime.startTurn(turnInput(text)),
         };
       });
@@ -255,6 +265,17 @@ type Harness = Effect.Success<ReturnType<typeof makeHarness>>;
 
 const withHarness = <A, E>(
   resolveSkillOverlay: ((cwd: string) => PreparedSkillOverlay | undefined) | undefined,
+  body: (harness: Harness) => Effect.Effect<A, E, Scope.Scope>,
+) =>
+  withHarnessResolver(
+    resolveSkillOverlay === undefined
+      ? undefined
+      : (cwd) => Effect.sync(() => resolveSkillOverlay(cwd)),
+    body,
+  );
+
+const withHarnessResolver = <A, E>(
+  resolveSkillOverlay: SkillOverlayResolver | undefined,
   body: (harness: Harness) => Effect.Effect<A, E, Scope.Scope>,
 ) =>
   makeHarness(resolveSkillOverlay).pipe(
@@ -382,14 +403,16 @@ describe("ClaudeAdapterV2 private project skills", () => {
       }),
   );
 
-  it.effect("keeps the live process while background work runs", () =>
+  it.effect("keeps the live process and its overlay while background work runs", () =>
     Effect.gen(function* () {
       let current: PreparedSkillOverlay | undefined;
+      const privateRoot = "/t3/private/skills";
       yield* withHarness(
         () => current,
         (harness) =>
           Effect.gen(function* () {
             const cwd = yield* harness.workspace("app");
+            current = privateOverlay(cwd, privateRoot);
             const thread = yield* harness.openThread(cwd, "background");
             yield* thread.runTurn("start a background build", [
               frame({
@@ -404,12 +427,53 @@ describe("ClaudeAdapterV2 private project skills", () => {
                 session_id: NATIVE_SESSION,
               }),
             ]);
-            current = privateOverlay(cwd, "/t3/private/skills");
-            yield* thread.runTurn("next");
+
+            // Cleared while the build runs: the process keeps the overlay it
+            // opened with, so the prompt still routes $review to the private
+            // file the process's settings expect, and the user is told.
+            current = undefined;
+            yield* thread.runTurn("please $review", [
+              frame({
+                type: "system",
+                subtype: "task_notification",
+                task_id: "bg-task",
+                tool_use_id: "toolu_bg",
+                status: "completed",
+                output_file: "/tmp/bg-task.output",
+                summary: "Build finished",
+                uuid: "00000000-0000-4000-8000-000000000202",
+                session_id: NATIVE_SESSION,
+              }),
+            ]);
             assert.equal(harness.opened.length, 1);
+            assert.include(userText(harness.offered[1]!)[0], `${privateRoot}/review/SKILL.md`);
+            assert.equal(thread.notices.length, 1);
+            assert.include(thread.notices[0], "background work finishes");
+
+            // The build is done, so the next turn reopens without the overlay.
+            yield* thread.runTurn("$review again");
+            assert.equal(harness.opened.length, 2);
+            const reopened = harness.opened[1]!.settings as Record<string, unknown>;
+            assert.isUndefined(reopened.skillOverrides);
+            assert.deepEqual(userText(harness.offered.at(-1)!), ["/review again"]);
+            assert.equal(thread.notices.length, 1);
           }),
       );
     }),
+  );
+
+  it.effect("fails the turn when the project's private settings cannot be read", () =>
+    withHarnessResolver(
+      () => Effect.fail(new SkillOverlayError({ detail: "Manifest unreadable; fix it." })),
+      (harness) =>
+        Effect.gen(function* () {
+          const thread = yield* harness.openThread(yield* harness.workspace("app"), "broken");
+          const exit = yield* Effect.exit(thread.startTurn("hello"));
+          assert.isTrue(Exit.isFailure(exit));
+          assert.include(String(Exit.isFailure(exit) ? exit.cause : ""), "Manifest unreadable");
+          assert.equal(harness.opened.length, 0);
+        }),
+    ),
   );
 
   it.effect("keeps each project's skills and instructions in its own session", () =>

@@ -4,7 +4,9 @@ import type { SkillEntry, SkillsReadResult } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   isSkillsRevisionConflict,
+  PRIVATE_PROJECT_SUPPORT_NOTICE,
   providerDisplayName,
+  sharedProfileNotice,
   skillsFailureMessage,
 } from "@t3tools/client-runtime/state/skills";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -96,6 +98,7 @@ export function SkillDetailRouteScreen({
   const isProjectPrivate = snapshot.scope.kind === "project" && snapshot.scope.mode !== "shared";
   const isShared = snapshot.scope.kind === "project" && snapshot.scope.mode === "shared";
   const canToggle = entry.ownership === "managed" || isProjectPrivate;
+  const profileNotice = isProjectPrivate ? sharedProfileNotice(snapshot.scope) : null;
   // Shared snapshots only list links for skills kept directly in `.agents/skills`.
   const showLinks =
     (entry.ownership === "managed" && entry.scope === "global" && entry.enabled) ||
@@ -152,6 +155,8 @@ export function SkillDetailRouteScreen({
             detail={`${skillEntrySummary(entry)}\n${entry.path}`}
           />
         </SettingsSection>
+        {profileNotice !== null && canToggle ? <SkillsNote>{profileNotice}</SkillsNote> : null}
+        {isProjectPrivate ? <SkillsNote>{PRIVATE_PROJECT_SUPPORT_NOTICE}</SkillsNote> : null}
 
         <SettingsSection>
           {canToggle ? (

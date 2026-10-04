@@ -57,6 +57,7 @@ import { ProjectToolkit } from "../../mcp/toolkits/project/tools.ts";
 import { WorktreeToolkit } from "../../mcp/toolkits/worktree/tools.ts";
 import { ThreadToolkit } from "../../mcp/toolkits/thread/tools.ts";
 import { OrchestratorToolkit } from "../../mcp/toolkits/orchestrator/tools.ts";
+import { SkillsToolkit } from "../../mcp/toolkits/skills/tools.ts";
 import { ClaudeExecutableFileCheck } from "../../provider/Drivers/ClaudeExecutable.ts";
 import type { EventNdjsonLogger } from "../../provider/Layers/EventNdjsonLogger.ts";
 import {
@@ -651,6 +652,7 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
       ...Object.values(ProjectToolkit.tools),
       ...Object.values(EnvironmentToolkit.tools),
       ...Object.values(PreviewControlsToolkit.tools),
+      ...Object.values(SkillsToolkit.tools),
     ]
       .filter((tool) => Context.get(tool.annotations, Tool.Readonly))
       .map((tool) => `mcp__t3-code__${tool.name}`)
@@ -660,6 +662,27 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
       [...ClaudeAdapterV2.CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS].sort(),
       readOnlyToolNames,
     );
+  });
+
+  it("keeps skill mutations out of read-only pre-approval", () => {
+    const skillTools = Object.values(SkillsToolkit.tools);
+    const mutations = skillTools.filter((tool) => !Context.get(tool.annotations, Tool.Readonly));
+    assert.lengthOf(mutations, 11);
+    for (const tool of skillTools) {
+      // Readonly and Destructive must disagree, otherwise the allowlist and
+      // the approval gate classify the tool differently.
+      assert.notEqual(
+        Context.get(tool.annotations, Tool.Readonly),
+        Context.get(tool.annotations, Tool.Destructive),
+        tool.name,
+      );
+    }
+    for (const tool of mutations) {
+      assert.notInclude(
+        ClaudeAdapterV2.CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS,
+        `mcp__t3-code__${tool.name}`,
+      );
+    }
   });
 });
 

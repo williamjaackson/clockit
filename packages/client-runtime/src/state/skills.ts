@@ -14,7 +14,9 @@ import {
   WS_METHODS,
   type EnvironmentId,
   type ProviderDriverKind,
+  type ResolvedSkillScope,
   type SkillEntry,
+  type SkillLinkStatus,
   type SkillProjectMode,
   type SkillScope,
   type SkillsListInput,
@@ -336,6 +338,38 @@ function matchesFilter(entry: SkillEntry, filter: SkillEntryFilter): boolean {
   }
 }
 
+/**
+ * What the user can do with one link target. An inherited link reaches the
+ * skill through a linked parent folder or someone else's link, so T3 neither
+ * adds nor removes anything there.
+ */
+export function skillLinkAction(status: SkillLinkStatus): "link" | "unlink" | "replace" | null {
+  switch (status.state) {
+    case "available":
+      return "link";
+    case "occupied":
+      return "replace";
+    case "linked":
+      return status.inherited ? null : "unlink";
+  }
+}
+
+export const INHERITED_LINK_NOTE =
+  "Reaches this through a linked parent folder or another link. T3 leaves it alone.";
+
+/**
+ * Names the folder whose private settings a project scope edits when it is
+ * not the project itself: an enclosing folder's, or a Git worktree's main
+ * checkout. Changes there reach every project that uses it. `null` otherwise.
+ */
+export function sharedProfileNotice(scope: ResolvedSkillScope): string | null {
+  const root = scope.profileRoot;
+  if (scope.mode !== "local" || root === undefined || root === scope.projectRoot) return null;
+  return scope.profileSource === "worktree"
+    ? `Uses the private settings of ${root} in the main checkout. Changes here also apply there and in its other worktrees.`
+    : `Uses the private settings of ${root}, which contains this project. Changes here also apply there.`;
+}
+
 export function providerDisplayName(provider: ProviderDriverKind): string {
   return PROVIDER_DISPLAY_NAMES[provider] ?? provider;
 }
@@ -468,4 +502,4 @@ export function skillsFailureMessage(error: unknown, fallback = "Try again."): s
  * changes, so terminal agents never see them.
  */
 export const PRIVATE_PROJECT_SUPPORT_NOTICE =
-  "Private changes apply only to Claude Code and Codex agents you run in T3 Code, not to terminal agents, teammates, or other providers. Private skills are listed to the agent, and a same-named repository or user skill is switched off in their favor. Claude Code picks up changes on its next turn, or once its background tasks finish. Codex picks up new skills and instructions on its next turn, but turning a skill off needs a new thread or a reloaded one. Agents read private skills as plain files, so provider-only settings such as allowed-tools or context: fork may not apply.";
+  "Private changes apply only to Claude Code and Codex agents you run in T3 Code, not to terminal agents, teammates, or other providers. Private skills are listed to the agent, and a same-named repository or user skill is switched off in their favor. Claude Code picks up changes on its next turn, or once its background tasks finish. Codex needs a new or reloaded thread for any change to which repository or user skills, or which repository instructions, it loads, and keeps its earlier skill setup until then. Other changes reach Codex on its next turn. Nothing is removed from a thread's history, so an agent may still act on what it already read. Agents read private skills as plain files, so provider-only settings such as allowed-tools or context: fork may not apply.";

@@ -8,7 +8,9 @@ import type {
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   isSkillsRevisionConflict,
+  PRIVATE_PROJECT_SUPPORT_NOTICE,
   providerDisplayName,
+  sharedProfileNotice,
   skillsFailureMessage,
 } from "@t3tools/client-runtime/state/skills";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -87,6 +89,7 @@ export function SkillInstructionsRouteScreen({
   });
   const shared = params.projectPath !== undefined && params.mode === "shared";
   const projectPrivate = params.projectPath !== undefined && !shared;
+  const profileNotice = snapshot === null ? null : sharedProfileNotice(snapshot.scope);
   const [sharedFile, setSharedFile] = useState<SkillInstructionFileName>("AGENTS.md");
   const file = shared ? sharedFile : undefined;
   const [documentState, setDocumentState] = useState<DocumentState>({ status: "loading" });
@@ -226,6 +229,9 @@ export function SkillInstructionsRouteScreen({
           </>
         ) : null}
 
+        {projectPrivate && profileNotice !== null ? (
+          <SkillsWarning title="Inherited private settings" detail={profileNotice} />
+        ) : null}
         {projectPrivate ? (
           <SettingsSection title="How your private instructions apply">
             {INSTRUCTION_MODES.map((option, index) => (
@@ -243,6 +249,7 @@ export function SkillInstructionsRouteScreen({
             ))}
           </SettingsSection>
         ) : null}
+        {projectPrivate ? <SkillsNote>{PRIVATE_PROJECT_SUPPORT_NOTICE}</SkillsNote> : null}
 
         <SkillsNote>
           {documentState.status === "ready"

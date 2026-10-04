@@ -11,6 +11,7 @@ import {
   findScopeLibraryEntry,
   GLOBAL_SKILLS_SCOPE,
   PRIVATE_PROJECT_SUPPORT_NOTICE,
+  sharedProfileNotice,
   skillScope,
   skillsScopeKey,
   type SkillEntryFilter,
@@ -141,6 +142,7 @@ export function SkillsPage() {
       : skillsEnvironment.view({ environmentId, scope }),
   );
   const snapshot = view.snapshot;
+  const profileNotice = snapshot === null ? null : sharedProfileNotice(snapshot.scope);
 
   const [tab, setTab] = useState<SkillsTab>("skills");
   const [query, setQuery] = useState("");
@@ -411,7 +413,13 @@ export function SkillsPage() {
               </Alert>
             ) : (
               <Alert variant="info">
+                {profileNotice !== null ? (
+                  <AlertTitle>Inherited private settings</AlertTitle>
+                ) : null}
                 <AlertDescription>
+                  {profileNotice !== null ? (
+                    <span className="block break-all">{profileNotice}</span>
+                  ) : null}
                   Stored outside the repository in{" "}
                   <span className="break-all">{snapshot.scope.libraryPath}</span>.{" "}
                   {PRIVATE_PROJECT_SUPPORT_NOTICE}

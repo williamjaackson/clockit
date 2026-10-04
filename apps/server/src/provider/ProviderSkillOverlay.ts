@@ -50,7 +50,7 @@ import { ProviderDriverError } from "./Errors.ts";
 /** Private skills listed to the agent; more stay usable through `$name`. */
 const MAX_LISTED_SKILLS = 100;
 const MAX_DESCRIPTION_CHARS = 300;
-/** Frontmatter sits at the top; a larger SKILL.md keeps its name only. */
+/** A larger private SKILL.md is not offered, since its flags go unchecked. */
 const MAX_FRONTMATTER_FILE_BYTES = 256_000;
 /** Codex's own default `project_doc_max_bytes`. Longer text points at the file. */
 const MAX_INSTRUCTION_BYTES = 32_768;
@@ -141,7 +141,8 @@ export const prepareSkillOverlay = Effect.fn("prepareSkillOverlay")(function* (
         : yield* fileSystem.readFileString(skillFile).pipe(Effect.orElseSucceed(() => undefined));
     const frontmatter = contents === undefined ? undefined : parseSkillFrontmatter(contents);
     // Claude Code refuses a skill whose frontmatter does not parse; so does T3.
-    if (info?.type !== "File" || frontmatter?.kind === "malformed") {
+    // An unread file could hide a manual-only flag, so it is not offered either.
+    if (contents === undefined || frontmatter?.kind === "malformed") {
       skipped.push(skillFile);
       continue;
     }
@@ -158,7 +159,7 @@ export const prepareSkillOverlay = Effect.fn("prepareSkillOverlay")(function* (
   }
   if (skipped.length > 0) {
     yield* Effect.logWarning(
-      "Private project skills with an unreadable SKILL.md are not offered; their names stay switched off.",
+      "Private project skills with an unreadable or oversized SKILL.md are not offered; their names stay switched off.",
       { skipped },
     );
   }

@@ -961,8 +961,8 @@ function claudeOverlayQueryOptions(
 
 export const CLAUDE_T3_MCP_TOOL_WILDCARD = "mcp__t3-code__*";
 
-// Must stay in sync with the Tool.Readonly annotations on OrchestratorToolkit;
-// ClaudeAdapterV2.test.ts cross-checks this list against the toolkit.
+// Must stay in sync with the Tool.Readonly annotations on the T3 MCP toolkits;
+// ClaudeAdapterV2.test.ts cross-checks this list against them.
 export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
   "mcp__t3-code__orchestrator_capabilities",
   "mcp__t3-code__list_scheduled_tasks",
@@ -981,6 +981,9 @@ export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
   "mcp__t3-code__t3_environment_read",
   "mcp__t3-code__t3_queue_list",
   "mcp__t3-code__t3_queue_read",
+  "mcp__t3-code__t3_skills_list",
+  "mcp__t3-code__t3_skills_read",
+  "mcp__t3-code__t3_skills_read_instructions",
 ];
 
 // Claude Code aborts an HTTP MCP call after 60 s ("The operation timed out.")

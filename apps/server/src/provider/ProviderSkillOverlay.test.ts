@@ -30,6 +30,7 @@ const overlay = (
   skills: [
     {
       name: "review",
+      folderName: "review",
       description: "Review a change",
       directory: `${PRIVATE}/review`,
       skillFile: `${PRIVATE}/review/SKILL.md`,
@@ -40,10 +41,12 @@ const overlay = (
   disabledRepoSkills: [
     {
       name: "deploy",
+      folderName: "deploy",
       directory: `${ROOT}/.claude/skills/deploy`,
       skillFile: `${ROOT}/.claude/skills/deploy/SKILL.md`,
     },
   ],
+  replaced: { names: ["review"], folderNames: [] },
   ...input,
   instructions: {
     mode: "inherit",
@@ -52,6 +55,8 @@ const overlay = (
     ...input.instructions,
   },
 });
+
+const NOTHING_REPLACED = { names: [], folderNames: [] };
 
 const native = (skill: Partial<ServerProviderSkill> & { readonly name: string }) =>
   ({ path: `${ROOT}/.claude/skills/${skill.name}/SKILL.md`, enabled: true, ...skill }) as const;
@@ -74,6 +79,11 @@ describe("ProviderSkillOverlay", () => {
       );
       yield* write("private/agent-only/SKILL.md", "---\nuser-invocable: false\n---\n");
       yield* write("private/broken/SKILL.md", "---\ndescription: [unclosed\n---\n");
+      // Past the read bound, so its manual-only flag cannot be checked.
+      yield* write(
+        "private/oversized/SKILL.md",
+        `---\ndisable-model-invocation: true\n---\n${"x".repeat(300_000)}`,
+      );
       yield* write("shared/deploy/SKILL.md", "# deploy\n");
       yield* fileSystem.makeDirectory(path.join(root, "repo/.agents/skills"), { recursive: true });
       yield* fileSystem.symlink(
@@ -85,7 +95,7 @@ describe("ProviderSkillOverlay", () => {
         projectRoot: path.join(root, "repo"),
         privateRoot: path.join(root, "private-root"),
         skillRoot: path.join(root, "private"),
-        skills: ["manual", "agent-only", "broken"].map((name) => ({
+        skills: ["manual", "agent-only", "broken", "oversized"].map((name) => ({
           name,
           path: path.join(root, "private", name),
         })),
@@ -127,26 +137,160 @@ describe("ProviderSkillOverlay", () => {
       assert.deepEqual(prepared.disabledRepoSkills, [
         {
           name: "deploy",
+          folderName: "deploy",
           directory: path.join(realRoot, "shared/deploy"),
           skillFile: path.join(realRoot, "shared/deploy/SKILL.md"),
         },
       ]);
+      // Unreadable and oversized private skills are not offered, but their names stay off.
+      assert.deepEqual(prepared.replaced, {
+        names: ["agent-only", "broken", "manual", "oversized"],
+        folderNames: [],
+      });
       const edited = yield* prepareSkillOverlay(backendOverlay("Be thorough."));
       assert.notEqual(edited.key, prepared.key);
       assert.equal((yield* prepareSkillOverlay(backendOverlay("Be brief."))).key, prepared.key);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("applies nothing when the backend overlay fails to resolve", () =>
+  it.effect("names skills by invocation name, and Claude originals by folder too", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.realPath(
+        yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-skill-overlay-names-" }),
+      );
+      const write = (relative: string, content: string) =>
+        Effect.gen(function* () {
+          const file = path.join(root, relative);
+          yield* fileSystem.makeDirectory(path.dirname(file), { recursive: true });
+          yield* fileSystem.writeFileString(file, content);
+        });
+      yield* write("private/review-v2/SKILL.md", "---\nname: review\ndescription: House\n---\n");
+      // The same profile seen from the primary checkout and a worktree of it.
+      for (const checkout of ["main", "worktree"]) {
+        yield* write(`${checkout}/.claude/skills/ship-it/SKILL.md`, "---\nname: deploy\n---\n");
+        yield* write(`${checkout}/.claude/skills/review/SKILL.md`, "---\nname: review\n---\n");
+      }
+      const backendOverlay = (checkout: string): SkillLibrary.ProjectSkillOverlay => ({
+        projectRoot: path.join(root, checkout),
+        privateRoot: path.join(root, "private-root"),
+        skillRoot: path.join(root, "private"),
+        skills: [
+          {
+            name: "review-v2",
+            path: path.join(root, "private/review-v2"),
+            invocationName: "review",
+          },
+        ],
+        suppressedRepoSkills: [
+          {
+            name: "deploy",
+            folderName: "ship-it",
+            path: path.join(root, checkout, ".claude/skills/ship-it"),
+            reason: "disabled",
+          },
+          { name: "review", path: null, reason: "replaced" },
+          {
+            name: "review",
+            folderName: "review",
+            path: path.join(root, checkout, ".claude/skills/review"),
+            reason: "replaced",
+          },
+        ],
+        instructions: {
+          mode: "inherit",
+          content: null,
+          path: path.join(root, "private-root/AGENTS.md"),
+          globalInstructionsEnabled: true,
+        },
+        provenance: {
+          manifestPath: path.join(root, "private-root/manifest.json"),
+          profileRoot: path.join(root, "main"),
+          source: checkout === "main" ? "project" : "worktree",
+        },
+      });
+      const main = yield* prepareSkillOverlay(backendOverlay("main"));
+      const worktree = yield* prepareSkillOverlay(backendOverlay("worktree"));
+
+      assert.deepEqual(
+        main.skills.map(({ name, folderName }) => [name, folderName]),
+        [["review", "review-v2"]],
+      );
+      assert.include(privateSkillInvocationText("run $review", main), "review-v2/SKILL.md");
+      assert.isUndefined(privateSkillInvocationText("run $review-v2", main));
+      assert.include(
+        codexSkillOverlayAdditionalContext(main).t3_private_skills!.value,
+        "- review: House",
+      );
+      for (const [prepared, checkout] of [
+        [main, "main"],
+        [worktree, "worktree"],
+      ] as const) {
+        const deployFile = path.join(root, checkout, ".claude/skills/ship-it/SKILL.md");
+        assert.deepEqual(codexSkillOverlayThreadConfig(prepared), {
+          "skills.config": [
+            { path: deployFile, enabled: false },
+            { name: "review", enabled: false },
+          ],
+        });
+        const claude = claudeSkillOverlayQuery(prepared, "/home/me/.claude", path);
+        assert.deepEqual(claude._tag === "Applied" ? claude.settings : undefined, {
+          skillOverrides: { deploy: "off", review: "off", "ship-it": "off" },
+        });
+        // Codex lists by frontmatter name and path, Claude by folder name.
+        assert.deepEqual(
+          applySkillOverlayToCatalog(
+            [
+              { name: "deploy", path: deployFile, enabled: true },
+              { name: "review", path: `${checkout}/review/SKILL.md`, enabled: true },
+            ],
+            prepared,
+            "codex",
+          ).map(({ name, path: file, enabled }) => [name, file, enabled]),
+          [
+            ["deploy", deployFile, false],
+            ["review", path.join(root, "private/review-v2/SKILL.md"), true],
+          ],
+        );
+        assert.deepEqual(
+          applySkillOverlayToCatalog(
+            [
+              native({ name: "ship-it", path: deployFile }),
+              native({ name: "review", path: `${checkout}/review/SKILL.md` }),
+            ],
+            prepared,
+            "claudeAgent",
+          ).map(({ name, enabled }) => [name, enabled]),
+          [
+            ["review", true],
+            ["ship-it", false],
+          ],
+        );
+      }
+      assert.notEqual(main.key, worktree.key);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("fails with an actionable error when private settings are unreadable", () =>
     Effect.gen(function* () {
       const resolver = makeSkillOverlayResolver(
         {
           resolveProjectOverlay: () =>
-            Effect.fail(new SkillsError({ reason: "filesystem", detail: "Unreadable." })),
+            Effect.fail(
+              new SkillsError({
+                reason: "filesystem",
+                detail: "A skill library file is unreadable.",
+                path: "/t3/skill-projects/abc/manifest.json",
+              }),
+            ),
         },
         { fileSystem: yield* FileSystem.FileSystem, path: yield* Path.Path },
       );
-      assert.isUndefined(yield* resolver(ROOT));
+      const error = yield* Effect.flip(resolver(ROOT));
+      assert.equal(error._tag, "SkillOverlayError");
+      assert.include(error.detail, "/t3/skill-projects/abc/manifest.json");
+      assert.include(error.detail, "will not start the agent");
       const none = makeSkillOverlayResolver(
         { resolveProjectOverlay: () => Effect.succeedNone },
         { fileSystem: yield* FileSystem.FileSystem, path: yield* Path.Path },
@@ -187,6 +331,7 @@ describe("ProviderSkillOverlay", () => {
       disabledRepoSkills: [
         {
           name: "deploy",
+          folderName: "deploy",
           directory: `${ROOT}/.agents/skills/deploy`,
           skillFile: `${ROOT}/.agents/skills/deploy/SKILL.md`,
         },
@@ -218,6 +363,7 @@ describe("ProviderSkillOverlay", () => {
         ...overlay().skills,
         {
           name: "agent-only",
+          folderName: "agent-only",
           description: undefined,
           directory: `${PRIVATE}/agent-only`,
           skillFile: `${PRIVATE}/agent-only/SKILL.md`,
@@ -269,6 +415,7 @@ describe("ProviderSkillOverlay", () => {
           overlay({
             skills: [],
             disabledRepoSkills: [],
+            replaced: NOTHING_REPLACED,
             instructions: { mode: "off", content: "x" },
           }),
           "/home/me/.claude",
@@ -338,13 +485,23 @@ describe("ProviderSkillOverlay", () => {
     });
     assert.deepEqual(
       codexSkillOverlayThreadConfig(
-        overlay({ skills: [], disabledRepoSkills: [], instructions: { mode: "replace" } }),
+        overlay({
+          skills: [],
+          disabledRepoSkills: [],
+          replaced: NOTHING_REPLACED,
+          instructions: { mode: "replace" },
+        }),
       ),
       { project_doc_max_bytes: 0 },
     );
     assert.deepEqual(
       codexSkillOverlayThreadConfig(
-        overlay({ skills: [], disabledRepoSkills: [], instructions: { mode: "append" } }),
+        overlay({
+          skills: [],
+          disabledRepoSkills: [],
+          replaced: NOTHING_REPLACED,
+          instructions: { mode: "append" },
+        }),
       ),
       {},
     );
@@ -367,12 +524,47 @@ describe("ProviderSkillOverlay", () => {
     ]);
     for (const entry of Object.values(context)) {
       assert.equal(entry.kind, "application");
-      assert.isAtMost(entry.value.length, 3_000);
+      assert.isAtMost(Buffer.byteLength(entry.value, "utf8"), 900);
     }
     const joined = instructionKeys.map((key) => context[key]!.value).join("\n");
     assert.include(joined, "Rule 0: keep it short.");
     assert.include(joined, "Rule 399: keep it short.");
     assert.include(context.t3_private_skills!.value, `${PRIVATE}/review/SKILL.md`);
     assert.deepEqual(codexSkillOverlayAdditionalContext(undefined), {});
+  });
+
+  it("bounds Codex context by UTF-8 bytes, so wide scripts stay under the token cap", () => {
+    // 3 bytes per character, no line breaks, and a 4-byte character mid-way.
+    const content = `${"規則".repeat(800)}😀${"守る".repeat(800)}`;
+    const context = codexSkillOverlayAdditionalContext(
+      overlay({
+        replaced: NOTHING_REPLACED,
+        skills: [],
+        instructions: { mode: "append", content },
+      }),
+    );
+    const values = Object.values(context).map((entry) => entry.value);
+    assert.isAbove(values.length, 6);
+    for (const value of values) {
+      assert.isAtMost(Buffer.byteLength(value, "utf8"), 900);
+      assert.notInclude(value, "\uFFFD");
+      // No chunk starts or ends inside a surrogate pair.
+      assert.isFalse(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/.test(value));
+    }
+    assert.include(values.join(""), content);
+
+    // Instructions are cut at Codex's 32 KiB budget, between characters.
+    const long = codexSkillOverlayAdditionalContext(
+      overlay({
+        replaced: NOTHING_REPLACED,
+        skills: [],
+        instructions: { mode: "append", content: "語".repeat(20_000) },
+      }),
+    );
+    const joined = Object.values(long)
+      .map((entry) => entry.value)
+      .join("");
+    assert.include(joined, "[Truncated. Read the rest from");
+    assert.isAtMost((joined.match(/語/g) ?? []).length, Math.floor(32_768 / 3));
   });
 });

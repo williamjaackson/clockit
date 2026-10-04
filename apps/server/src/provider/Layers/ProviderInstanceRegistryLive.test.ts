@@ -43,6 +43,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
@@ -62,7 +63,12 @@ import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import * as OpenCodeServerLedger from "../OpenCodeServerLedger.ts";
 import * as ResetCreditCoordinator from "./resetCreditCoordinator.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
-import { makeProviderInstanceRegistry } from "./ProviderInstanceRegistryLive.ts";
+import * as SkillLibrary from "../../skills/SkillLibrary.ts";
+import * as ProviderInstanceRegistry from "../Services/ProviderInstanceRegistry.ts";
+import {
+  makeProviderInstanceRegistry,
+  ProviderInstanceRegistryMutableLayer,
+} from "./ProviderInstanceRegistryLive.ts";
 import { ProviderOrchestrationAdapterInfrastructureLive } from "./ProviderOrchestrationAdapterInfrastructure.ts";
 
 const TestHttpClientLive = Layer.succeed(
@@ -337,6 +343,77 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
       const snapshot = yield* instance!.snapshot.getSnapshot;
       expect(snapshot.enabled).toBe(false);
     }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.live("gives drivers the skill library the runtime provides around the registry", () =>
+    Effect.gen(function* () {
+      if (yield* isHostWindows) return;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const fixtures = yield* makeTildeProviderFixtures();
+      const base = yield* fileSystem.realPath(
+        yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-skill-wiring-" }),
+      );
+      const projectRoot = path.join(base, "app");
+      const skillPath = path.join(base, "private/skills/review");
+      yield* fileSystem.makeDirectory(projectRoot, { recursive: true });
+      yield* fileSystem.makeDirectory(skillPath, { recursive: true });
+      yield* fileSystem.writeFileString(
+        path.join(skillPath, "SKILL.md"),
+        "---\ndescription: House review\n---\n",
+      );
+      const resolved: Array<string> = [];
+      const library = Layer.mock(SkillLibrary.SkillLibrary)({
+        resolveProjectOverlay: (cwd) =>
+          Effect.sync(() => {
+            resolved.push(cwd);
+            return Option.some<SkillLibrary.ProjectSkillOverlay>({
+              projectRoot,
+              privateRoot: path.join(base, "private"),
+              skillRoot: path.join(base, "private/skills"),
+              skills: [{ name: "review", path: skillPath, invocationName: "review" }],
+              suppressedRepoSkills: [{ name: "review", path: null, reason: "replaced" }],
+              instructions: {
+                mode: "inherit",
+                content: null,
+                path: path.join(base, "private/AGENTS.md"),
+                globalInstructionsEnabled: true,
+              },
+              provenance: { manifestPath: path.join(base, "private/manifest.json") },
+            });
+          }),
+        streamChanges: Stream.never,
+      });
+      const codexId = ProviderInstanceId.make("codex_skills");
+      const registryLayer = ProviderInstanceRegistryMutableLayer({
+        drivers: [CodexDriver],
+        configMap: {
+          [codexId]: {
+            driver: ProviderDriverKind.make("codex"),
+            enabled: true,
+            environment: [
+              { name: "T3_CODEX_COLLAB_SCRIPT", value: fixtures.codexScriptPath, sensitive: false },
+            ],
+            config: makeCodexConfig({ enabled: true, binaryPath: fixtures.codexBinaryPath }),
+          },
+        },
+      });
+      const catalogFor = (layer: typeof registryLayer) =>
+        Effect.gen(function* () {
+          const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+          const codex = yield* registry.getInstance(codexId);
+          const snapshot = yield* codex!.snapshotForCwd!(projectRoot);
+          return snapshot.skills.map((skill) => [skill.name, skill.path]);
+        }).pipe(Effect.provide(layer));
+
+      // Provided outside the registry layer, as the server runtime does.
+      const withLibrary = yield* catalogFor(registryLayer.pipe(Layer.provide(library)));
+      expect(withLibrary).toEqual([["review", path.join(skillPath, "SKILL.md")]]);
+      expect(resolved).toEqual([projectRoot]);
+
+      expect(yield* catalogFor(registryLayer)).toEqual([]);
+      expect(resolved).toEqual([projectRoot]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
   it.live("reports Codex's answer when a redemption changed nothing", () =>

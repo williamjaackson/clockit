@@ -6,7 +6,7 @@ import type {
   SkillPathKind,
   SkillScope,
 } from "@t3tools/contracts";
-import { providerDisplayName } from "@t3tools/client-runtime/state/skills";
+import { INHERITED_LINK_NOTE, providerDisplayName } from "@t3tools/client-runtime/state/skills";
 import { useState } from "react";
 
 import { skillsEnvironment } from "../../state/skills";
@@ -94,8 +94,13 @@ export function SkillLinkTargets(props: {
             <div className="flex min-w-0 flex-1 flex-col">
               <span className="text-sm font-medium">{providersFor(status.targetId)}</span>
               <span className="break-all text-xs text-muted-foreground">{status.path}</span>
+              {status.inherited ? (
+                <span className="text-xs text-muted-foreground">{INHERITED_LINK_NOTE}</span>
+              ) : null}
             </div>
-            {status.state === "linked" ? (
+            {status.state === "linked" && status.inherited ? (
+              <Badge variant="success">Linked via parent</Badge>
+            ) : status.state === "linked" ? (
               <>
                 <Badge variant="success">Linked</Badge>
                 <Button

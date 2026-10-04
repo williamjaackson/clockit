@@ -11,6 +11,8 @@ import {
   filterSkillEntries,
   findScopeLibraryEntry,
   newSkillContent,
+  sharedProfileNotice,
+  skillLinkAction,
   skillScope,
   skillsFailureMessage,
   skillsScopeKey,
@@ -82,6 +84,39 @@ describe("filterSkillEntries", () => {
     expect(
       filterSkillEntries(entries, { query: "", filter: "disabled" }).map((e) => e.name),
     ).toEqual(["old"]);
+  });
+});
+
+describe("skillLinkAction", () => {
+  const status = { targetId: "claude", path: "/home/me/.claude/skills/mine" };
+
+  it("offers no unlink for a link T3 did not make", () => {
+    expect(skillLinkAction({ ...status, state: "linked" })).toBe("unlink");
+    expect(skillLinkAction({ ...status, state: "linked", inherited: true })).toBeNull();
+    expect(skillLinkAction({ ...status, state: "available" })).toBe("link");
+    expect(skillLinkAction({ ...status, state: "occupied", occupant: "directory" })).toBe(
+      "replace",
+    );
+  });
+});
+
+describe("sharedProfileNotice", () => {
+  const scope = {
+    kind: "project",
+    mode: "local",
+    projectRoot: "/work/repo/packages/app",
+    libraryPath: "/home/me/.t3/skill-projects/abc/skills",
+  } as const;
+
+  it("names the folder whose private settings a project edits when it is not the project", () => {
+    expect(sharedProfileNotice({ ...scope, profileRoot: scope.projectRoot })).toBeNull();
+    expect(
+      sharedProfileNotice({ ...scope, profileRoot: "/work/repo", profileSource: "project" }),
+    ).toContain("/work/repo,");
+    expect(
+      sharedProfileNotice({ ...scope, profileRoot: "/main/repo", profileSource: "worktree" }),
+    ).toContain("/main/repo in the main checkout");
+    expect(sharedProfileNotice({ ...scope, mode: "shared", profileRoot: "/work/repo" })).toBeNull();
   });
 });
 

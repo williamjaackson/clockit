@@ -44,14 +44,23 @@ don't see them.
   the file when a task matches. Mentioning one with `$name` tells the agent to use it.
 - A private skill switches off any repository or user skill with the same name, so the agent only
   sees your copy. Turning a repository skill off works the same way.
-- Claude Code picks up changes on its next turn. Codex picks up new private skills and instructions
-  on its next turn, but turning a skill off only takes effect in a new thread or after the thread
-  reloads.
+- Claude Code picks up changes on its next turn, or once its background tasks finish.
+- Codex needs a new or reloaded thread for any change to which repository or user skills, or
+  which repository instructions, it loads: turning a skill off, adding a private skill that
+  replaces one, or replacing or turning off the repository's instructions. Until then the thread
+  keeps its earlier skill setup. Other changes, such as editing a private skill, reach Codex on
+  its next turn.
+- Changes never reach back into a thread's history. If an agent already read a skill or
+  instruction file, it can still act on it until you start a new thread.
 - Private skills are plain files to the agent, so provider-only frontmatter such as
   `allowed-tools` or `context: fork` may not apply.
 
 For private instructions, choose whether they add to the repository's `AGENTS.md` or `CLAUDE.md`,
 replace them, or turn project instructions off.
+
+Private settings belong to a folder, and every project inside it uses them unless it has its own.
+A sub-project or Git worktree with none of its own shows and edits the settings it inherits, and
+T3 names the folder they belong to. Changes there apply everywhere that uses them.
 
 Switch to **Repository files** to edit the project's own skill folders, `AGENTS.md`, and
 `CLAUDE.md`. These edits change files in the checkout, so terminal agents and teammates see them

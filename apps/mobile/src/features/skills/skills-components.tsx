@@ -8,7 +8,12 @@ import type {
   SkillPathKind,
   SkillScope,
 } from "@t3tools/contracts";
-import { isUnlinkedLibrarySkill, providerDisplayName } from "@t3tools/client-runtime/state/skills";
+import {
+  INHERITED_LINK_NOTE,
+  isUnlinkedLibrarySkill,
+  providerDisplayName,
+  skillLinkAction,
+} from "@t3tools/client-runtime/state/skills";
 import { useEffect, useState, type ReactNode } from "react";
 import { ActivityIndicator, Platform, Pressable, TextInput, View } from "react-native";
 
@@ -221,35 +226,40 @@ export function SkillLinkRows(props: {
     setPendingId(null);
   };
 
-  return props.links.map((status, index) => (
-    <SkillsDetailRow
-      key={status.targetId}
-      title={props.providersFor(status.targetId)}
-      detail={status.path}
-      borderTop={index > 0}
-      accessory={
-        pendingId === status.targetId ? (
-          <ActivityIndicator colorClassName="accent-icon" />
-        ) : (
-          <Pressable
-            accessibilityRole="button"
-            disabled={pendingId !== null}
-            onPress={() => void run(status)}
-            className="rounded-full bg-subtle px-3 py-2 active:opacity-70"
-          >
-            <Text className="text-sm font-t3-medium text-foreground">
-              {status.state === "linked"
-                ? "Unlink"
-                : status.state === "available"
-                  ? "Link"
-                  : "Replace"}
+  return props.links.map((status, index) => {
+    const action = skillLinkAction(status);
+    return (
+      <SkillsDetailRow
+        key={status.targetId}
+        title={props.providersFor(status.targetId)}
+        detail={status.path}
+        borderTop={index > 0}
+        accessory={
+          action === null ? (
+            <Text accessibilityHint={INHERITED_LINK_NOTE} className="text-sm text-foreground-muted">
+              Linked via parent
             </Text>
-          </Pressable>
-        )
-      }
-    />
-  ));
+          ) : pendingId === status.targetId ? (
+            <ActivityIndicator colorClassName="accent-icon" />
+          ) : (
+            <Pressable
+              accessibilityRole="button"
+              disabled={pendingId !== null}
+              onPress={() => void run(status)}
+              className="rounded-full bg-subtle px-3 py-2 active:opacity-70"
+            >
+              <Text className="text-sm font-t3-medium text-foreground">
+                {LINK_ACTION_LABEL[action]}
+              </Text>
+            </Pressable>
+          )
+        }
+      />
+    );
+  });
 }
+
+const LINK_ACTION_LABEL = { link: "Link", unlink: "Unlink", replace: "Replace" } as const;
 
 export type SkillFileSaveOutcome =
   | { readonly _tag: "saved"; readonly revision: string | null }

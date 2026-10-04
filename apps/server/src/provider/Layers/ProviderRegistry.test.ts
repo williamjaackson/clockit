@@ -66,6 +66,7 @@ import { COMPACT_SLASH_COMMAND } from "../providerSnapshot.ts";
 import type { ProviderInstance, ProviderWorkspaceSnapshot } from "../ProviderDriver.ts";
 import * as ProviderInstanceRegistry from "../Services/ProviderInstanceRegistry.ts";
 import * as ProviderRegistry from "../Services/ProviderRegistry.ts";
+import * as SkillLibrary from "../../skills/SkillLibrary.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 const decodeServerSettings = Schema.decodeSync(ServerSettings);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
@@ -1809,6 +1810,157 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
             }
             assert.strictEqual(rebuilt[0]?.checkedAt, rebuiltProvider.checkedAt);
             assert.strictEqual(rebuilt[0]?.workspaceSnapshots, undefined);
+          }).pipe(Effect.provide(runtimeServices));
+        }),
+      );
+
+      it.effect("drops workspace catalogs on skill changes and rescans ones caught mid-scan", () =>
+        Effect.gen(function* () {
+          const driver = ProviderDriverKind.make("codex");
+          const instanceId = ProviderInstanceId.make("codex");
+          const machineProvider = {
+            instanceId,
+            driver,
+            status: "ready",
+            enabled: true,
+            installed: true,
+            auth: { status: "authenticated" },
+            checkedAt: "2026-06-10T00:00:00.000Z",
+            version: "1.0.0",
+            models: [],
+            slashCommands: [],
+            skills: [],
+          } as const satisfies ServerProvider;
+          const catalog = (name: string) => ({
+            ...machineProvider,
+            skills: [{ name, path: `/workspace/${name}/SKILL.md`, enabled: true }],
+          });
+          const scopedResult = yield* Ref.make<ProviderWorkspaceSnapshot>(catalog("before"));
+          const scans = yield* Ref.make(0);
+          const scanGate = yield* Ref.make<{
+            readonly started: Deferred.Deferred<void>;
+            readonly release: Deferred.Deferred<void>;
+          } | null>(null);
+          const machineRefreshes = yield* Ref.make<ReadonlyArray<Deferred.Deferred<void>>>([]);
+          const nextMachineRefresh = Effect.gen(function* () {
+            const refreshed = yield* Deferred.make<void>();
+            yield* Ref.update(machineRefreshes, (current) => [...current, refreshed]);
+            return refreshed;
+          });
+          const instance: ProviderInstance = {
+            instanceId,
+            driverKind: driver,
+            continuationIdentity: { driverKind: driver, continuationKey: "codex:instance:codex" },
+            displayName: undefined,
+            enabled: true,
+            snapshot: {
+              resolveMaintenance: () =>
+                Effect.succeed(
+                  makeManualOnlyProviderMaintenanceCapabilities({
+                    provider: driver,
+                    packageName: null,
+                  }),
+                ),
+              getSnapshot: Effect.succeed(machineProvider),
+              refresh: Ref.getAndSet(machineRefreshes, []).pipe(
+                Effect.flatMap((waiting) =>
+                  Effect.forEach(waiting, (refreshed) => Deferred.succeed(refreshed, undefined)),
+                ),
+                Effect.as(machineProvider),
+              ),
+              streamChanges: Stream.empty,
+              applyUsageLimits: () => Effect.void,
+            },
+            snapshotForCwd: () =>
+              Effect.gen(function* () {
+                // Read before the gate, as a real scan reads files first.
+                const result = yield* Ref.get(scopedResult);
+                yield* Ref.update(scans, (count) => count + 1);
+                const gate = yield* Ref.getAndSet(scanGate, null);
+                if (gate) {
+                  yield* Deferred.succeed(gate.started, undefined);
+                  yield* Deferred.await(gate.release);
+                }
+                return result;
+              }),
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+            textGeneration: {} as ProviderInstance["textGeneration"],
+          };
+          const registryChanges = yield* PubSub.unbounded<void>();
+          const skillChanges = yield* PubSub.unbounded<SkillLibrary.SkillLibraryChange>();
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const runtimeServices = yield* Layer.build(
+            ProviderRegistryLive.pipe(
+              Layer.provideMerge(
+                Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+                  getInstance: () => Effect.succeed(instance),
+                  listInstances: Effect.succeed([instance]),
+                  listUnavailable: Effect.succeed([]),
+                  streamChanges: Stream.fromPubSub(registryChanges),
+                  subscribeChanges: PubSub.subscribe(registryChanges),
+                }),
+              ),
+              Layer.provideMerge(
+                Layer.mock(SkillLibrary.SkillLibrary)({
+                  streamChanges: Stream.fromPubSub(skillChanges),
+                }),
+              ),
+              Layer.provideMerge(
+                ServerConfig.layerTest(process.cwd(), {
+                  prefix: "t3-provider-registry-skill-changes-",
+                }),
+              ),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          ).pipe(Scope.provide(scope));
+
+          // Published the moment the layer is built: the registry subscribed
+          // during construction, so this global change still re-reads the
+          // provider's own skill list.
+          const bootRefresh = yield* nextMachineRefresh;
+          yield* PubSub.publish(skillChanges, {});
+          yield* Deferred.await(bootRefresh);
+
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderRegistry.ProviderRegistry;
+            const workspaceSkills = Effect.map(registry.getProviders, (providers) =>
+              providers[0]?.workspaceSnapshots?.map((snapshot) => snapshot.skills),
+            );
+            yield* registry.refreshWorkspaceSnapshot({ instanceId, cwd: "/workspace" });
+            assert.deepStrictEqual(yield* workspaceSkills, [catalog("before").skills]);
+
+            // A project change while a scan is reading: the snapshot is
+            // dropped, and the scan that read the old files scans again
+            // instead of writing what it read.
+            const started = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            yield* Ref.set(scanGate, { started, release });
+            const scan = yield* registry
+              .refreshWorkspaceSnapshot({ instanceId, cwd: "/workspace", fresh: true })
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(started);
+            const dropped = yield* registry.streamChanges.pipe(
+              Stream.filter((providers) => providers[0]?.workspaceSnapshots === undefined),
+              Stream.runHead,
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* Ref.set(scopedResult, catalog("after"));
+            yield* PubSub.publish(skillChanges, {
+              projectRoot: "/elsewhere",
+              profileRoot: "/workspace",
+            });
+            assert.strictEqual((yield* Fiber.join(dropped))._tag, "Some");
+            yield* Deferred.succeed(release, undefined);
+            yield* Fiber.join(scan);
+            assert.deepStrictEqual(yield* workspaceSkills, [catalog("after").skills]);
+            assert.strictEqual(yield* Ref.get(scans), 3);
+
+            // A global change drops catalogs too and re-reads the machine list.
+            const globalRefresh = yield* nextMachineRefresh;
+            yield* PubSub.publish(skillChanges, {});
+            yield* Deferred.await(globalRefresh);
+            assert.strictEqual(yield* workspaceSkills, undefined);
           }).pipe(Effect.provide(runtimeServices));
         }),
       );

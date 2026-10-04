@@ -11,6 +11,7 @@ import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime"
 import {
   isSkillsRevisionConflict,
   providerDisplayName,
+  sharedProfileNotice,
   skillsFailureMessage,
 } from "@t3tools/client-runtime/state/skills";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -176,6 +177,7 @@ export function SkillsInstructions(props: {
   };
 
   const mode = snapshot.instructions.mode ?? "inherit";
+  const profileNotice = sharedProfileNotice(snapshot.scope);
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
@@ -206,6 +208,9 @@ export function SkillsInstructions(props: {
           <p className="text-xs text-muted-foreground">
             {INSTRUCTION_MODES.find((option) => option.value === mode)?.description}
           </p>
+          {profileNotice !== null ? (
+            <p className="break-all text-xs text-muted-foreground">{profileNotice}</p>
+          ) : null}
         </section>
       ) : null}
 
