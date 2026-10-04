@@ -77,6 +77,7 @@ describe("getChangeRequest base freshness", () => {
     createdAt: "2026-07-01T00:00:00Z",
     updatedAt: "2026-07-02T00:00:00Z",
     reviewRequestLogins: [],
+    assigneeLogins: [],
     labels: [],
     body: "",
     changedFiles: 1,

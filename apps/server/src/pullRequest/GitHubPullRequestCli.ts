@@ -973,6 +973,8 @@ function involvementArgs(input: {
       ];
   return [
     ...(input.involvement === "authored" ? ["--author", input.viewer] : []),
+    // `gh` answers `--assignee` through search, so the fallback leaves it to the local filter.
+    ...(input.involvement === "assigned" && input.sorted ? ["--assignee", input.viewer] : []),
     ...(searchTerms.length > 0 ? ["--search", searchTerms.join(" ")] : []),
   ];
 }
@@ -989,12 +991,21 @@ function matchesUnsortedListing(
 ): boolean {
   const matchesState = input.state === "all" || item.state === input.state;
   const viewer = input.viewer.toLowerCase();
-  const matchesInvolvement =
-    input.involvement === "all" ||
-    (input.involvement === "authored"
-      ? item.author?.login.toLowerCase() === viewer
-      : item.hasTeamReviewRequest ||
-        item.reviewRequestLogins.some((login) => login.toLowerCase() === viewer));
+  const matchesInvolvement = (() => {
+    switch (input.involvement) {
+      case "all":
+        return true;
+      case "authored":
+        return item.author?.login.toLowerCase() === viewer;
+      case "assigned":
+        return item.assigneeLogins.some((login) => login.toLowerCase() === viewer);
+      case "reviewing":
+        return (
+          item.hasTeamReviewRequest ||
+          item.reviewRequestLogins.some((login) => login.toLowerCase() === viewer)
+        );
+    }
+  })();
   return matchesState && matchesInvolvement && matchesFilters(item, input.filters, input.viewer);
 }
 
@@ -1036,6 +1047,7 @@ function searchQuery(input: {
     ...(input.state === "merged" ? ["is:merged"] : []),
     ...(input.involvement === "authored" ? [`author:${input.viewer}`] : []),
     ...(input.involvement === "reviewing" ? [`review-requested:${input.viewer}`] : []),
+    ...(input.involvement === "assigned" ? [`assignee:${input.viewer}`] : []),
     ...(query.length === 0 ? [] : [searchPhrase(query)]),
     // Inclusive, and de-duplicated by the caller, for the reason the per-repository read gives.
     ...(input.cursor === undefined ? [] : [`updated:<=${input.cursor.updatedBefore}`]),

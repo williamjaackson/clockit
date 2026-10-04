@@ -113,6 +113,12 @@ Open **Pull requests** to review changes and comments, request reviewers, check 
 or merge. You can edit review titles and descriptions and your own comments where the host allows it.
 GitLab calls these merge requests.
 
+The **All** view lists pull requests assigned to you first, then ones you authored, then ones
+waiting on your review. Each pull request appears once, in the first group that fits. The
+**Assigned** filter shows only your assignments. **Authored** still shows every pull request you
+opened, whoever it is assigned to. Azure DevOps and Bitbucket pull requests have no assignees, so
+they never appear under Assigned.
+
 GitHub, GitLab, and Azure DevOps support auto-merge while checks are outstanding. GitHub also
 supports approving waiting fork workflows and opening a revert pull request for a merged change.
 

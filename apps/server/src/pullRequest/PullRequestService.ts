@@ -1140,6 +1140,10 @@ export const make = Effect.gen(function* () {
       viewerReviewRequested:
         input.item.author?.login.toLowerCase() !== viewer &&
         input.item.reviewRequestLogins.some((login) => login.toLowerCase() === viewer),
+      // Sent only when true: absent already reads as not assigned.
+      ...(input.item.assigneeLogins?.some((login) => login.toLowerCase() === viewer)
+        ? { viewerAssigned: true }
+        : {}),
       labels: input.item.labels,
       ...(input.item.reviewDecision === undefined || input.item.reviewDecision === null
         ? {}

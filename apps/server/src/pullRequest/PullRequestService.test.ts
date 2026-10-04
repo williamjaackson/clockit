@@ -1969,6 +1969,52 @@ it.effect("flags a review request for the viewer but not on their own change req
   }),
 );
 
+it.effect("flags the viewer's assignments, their own change requests included", () =>
+  Effect.gen(function* () {
+    const service = yield* makeService({
+      projects: [
+        project({ id: "p1", title: "t3code", workspaceRoot: "/a", repository: "pingdotgg/t3code" }),
+      ],
+      providers: [
+        fakeProvider("github", {
+          listChangeRequests: () =>
+            Effect.succeed({
+              items: [
+                { ...changeRequest(1, "2026-07-04T00:00:00Z"), assigneeLogins: ["Bilal"] },
+                {
+                  ...changeRequest(2, "2026-07-03T00:00:00Z"),
+                  author: { login: "bilal", name: null, avatarUrl: null },
+                  assigneeLogins: ["hubot", "BILAL"],
+                },
+                {
+                  ...changeRequest(3, "2026-07-02T00:00:00Z"),
+                  reviewRequestLogins: ["bilal"],
+                  assigneeLogins: ["hubot"],
+                },
+                // A host that has no assignees leaves the field out.
+                changeRequest(4, "2026-07-01T00:00:00Z"),
+              ],
+              truncated: false,
+              continues: true,
+            }),
+        }),
+      ],
+    });
+
+    const result = yield* service.list({ state: "open" });
+
+    assert.deepStrictEqual(
+      result.entries.map((entry) => [entry.number, entry.viewerAssigned === true]),
+      [
+        [1, true],
+        [2, true],
+        [3, false],
+        [4, false],
+      ],
+    );
+  }),
+);
+
 it.effect("refuses a repository that does not belong to the requested project", () =>
   Effect.gen(function* () {
     const service = yield* makeService({

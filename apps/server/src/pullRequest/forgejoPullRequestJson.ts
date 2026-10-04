@@ -62,6 +62,16 @@ export const ForgejoPullRequest = Schema.Struct({
   comments: Schema.optional(Schema.Int),
   labels: Schema.NullOr(Schema.Array(ForgejoLabel)),
   requested_reviewers: Schema.optional(Schema.NullOr(Schema.Array(ForgejoUser))),
+  assignees: Schema.optional(Schema.NullOr(Schema.Array(ForgejoUser))),
+});
+/** A row of the issues listing, read only to learn which pull requests to fetch. */
+export const ForgejoIssue = Schema.Struct({
+  number: Schema.Int,
+  state: Schema.String,
+  // `merged` is absent from older servers' rows.
+  pull_request: Schema.optional(
+    Schema.NullOr(Schema.Struct({ merged: Schema.optional(Schema.Boolean) })),
+  ),
 });
 export const ForgejoComment = Schema.Struct({
   id: Schema.Int,
@@ -144,6 +154,7 @@ export function forgejoChangeRequest(pr: typeof ForgejoPullRequest.Type) {
     closedAt: pr.closed_at === null ? null : toIsoUtc(pr.closed_at),
     mergedAt: pr.merged_at === null ? null : toIsoUtc(pr.merged_at),
     reviewRequestLogins: (pr.requested_reviewers ?? []).map((user) => user.login),
+    assigneeLogins: (pr.assignees ?? []).map((user) => user.login),
     labels: (pr.labels ?? []).map((label) => ({ name: label.name, color: label.color ?? null })),
   } satisfies ProviderChangeRequest;
 }

@@ -134,6 +134,30 @@ function patchedPaths(patch: string): ReadonlyArray<string> {
   );
 }
 
+describe("listChangeRequests", () => {
+  it.effect("answers an assigned listing with nothing, without asking the host", () =>
+    Effect.gen(function* () {
+      // listPullRequests is left unimplemented, so reaching the host would die instead.
+      const provider = yield* make.pipe(
+        Effect.provide(Layer.mock(AzureDevOpsPullRequestCli.AzureDevOpsPullRequestCli)({})),
+      );
+
+      const page = yield* provider.listChangeRequests({
+        cwd: "/w",
+        repository: "acme/web",
+        host: "dev.azure.com",
+        state: "open",
+        involvement: "assigned",
+        viewer: "bilal",
+        limit: 10,
+      });
+
+      expect(page.items).toEqual([]);
+      expect(page.truncated).toBe(false);
+    }),
+  );
+});
+
 describe("getChangeRequestSummary", () => {
   it.effect("costs the one pull request read, not the iterations changedFiles needs", () =>
     Effect.gen(function* () {

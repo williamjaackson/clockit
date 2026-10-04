@@ -169,7 +169,8 @@ export class AzureDevOpsPullRequestCli extends Context.Service<
       readonly cwd: string;
       readonly repository: string;
       readonly state: PullRequestListState;
-      readonly involvement: PullRequestInvolvement;
+      /** Never "assigned": Azure has no assignees, so the provider answers that one itself. */
+      readonly involvement: Exclude<PullRequestInvolvement, "assigned">;
       readonly viewer: string;
       readonly limit: number;
       /**
@@ -274,7 +275,7 @@ function statusArgs(state: PullRequestListState): ReadonlyArray<string> {
 }
 
 function involvementArgs(input: {
-  readonly involvement: PullRequestInvolvement;
+  readonly involvement: Exclude<PullRequestInvolvement, "assigned">;
   readonly viewer: string;
 }): ReadonlyArray<string> {
   switch (input.involvement) {
@@ -438,7 +439,7 @@ export const make = Effect.gen(function* () {
     readonly cwd: string;
     readonly repository: string;
     readonly state: PullRequestListState;
-    readonly involvement: PullRequestInvolvement;
+    readonly involvement: Exclude<PullRequestInvolvement, "assigned">;
     readonly viewer: string;
     readonly limit: number;
     readonly skip: number;

@@ -68,6 +68,8 @@ const RawReviewRequestSchema = Schema.Struct({
   name: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
+const RawAssigneeSchema = Schema.Struct({ login: Schema.optional(Schema.NullOr(Schema.String)) });
+
 /** One reviewer's most recent review: the state is all the verdict needs, the author is for who. */
 const RawLatestReviewSchema = Schema.Struct({
   author: Schema.optional(Schema.NullOr(RawActorSchema)),
@@ -114,6 +116,7 @@ const RawListItemSchema = Schema.Struct({
   updatedAt: Schema.String,
   mergedAt: Schema.optional(Schema.NullOr(Schema.String)),
   reviewRequests: Schema.optional(Schema.Array(RawReviewRequestSchema)),
+  assignees: Schema.optional(Schema.NullOr(Schema.Array(RawAssigneeSchema))),
   latestReviews: Schema.optional(Schema.NullOr(Schema.Array(RawLatestReviewSchema))),
   labels: Schema.optional(Schema.Array(RawLabelSchema)),
   /**
@@ -173,6 +176,13 @@ const RawSearchItemSchema = Schema.Struct({
             ),
           ),
         ),
+      }),
+    ),
+  ),
+  assignees: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        nodes: Schema.optional(Schema.NullOr(Schema.Array(Schema.NullOr(RawAssigneeSchema)))),
       }),
     ),
   ),
@@ -704,7 +714,7 @@ export function decodeActorAvatarsJson(
 }
 
 export const PULL_REQUEST_LIST_JSON_FIELDS =
-  "number,title,url,author,headRefName,baseRefName,state,isDraft,mergeable,reviewDecision,additions,deletions,createdAt,updatedAt,mergedAt,reviewRequests,latestReviews,labels,statusCheckRollup";
+  "number,title,url,author,headRefName,baseRefName,state,isDraft,mergeable,reviewDecision,additions,deletions,createdAt,updatedAt,mergedAt,reviewRequests,assignees,latestReviews,labels,statusCheckRollup";
 
 export const PULL_REQUEST_DETAIL_JSON_FIELDS = `${PULL_REQUEST_LIST_JSON_FIELDS},body,changedFiles,closedAt,isCrossRepository,headRepositoryOwner,headRefOid,autoMergeRequest`;
 
@@ -837,6 +847,7 @@ export function pullRequestSearchGraphQlQuery(rows: number, includeStacks = fals
         mergedAt
         repository { nameWithOwner }
         reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
+        assignees(first: 10) { nodes { login } }
         labels(first: 20) { nodes { name color } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
@@ -1200,6 +1211,7 @@ export interface GitHubPullRequestListItem {
   readonly reviewRequestLogins: ReadonlyArray<string>;
   /** At least one outstanding request targets a team rather than an individual login. */
   readonly hasTeamReviewRequest: boolean;
+  readonly assigneeLogins: ReadonlyArray<string>;
   readonly labels: ReadonlyArray<PullRequestLabel>;
   /** Null where the head commit reported no checks, which is not the same as passing none. */
   readonly checksState: PullRequestChecksState | null;
@@ -1610,6 +1622,10 @@ function toListItem(raw: Schema.Schema.Type<typeof RawListItemSchema>): GitHubPu
     updatedAt: raw.updatedAt,
     reviewRequestLogins: toReviewRequestLogins(raw.reviewRequests),
     hasTeamReviewRequest: hasTeamReviewRequest(raw.reviewRequests),
+    assigneeLogins: (raw.assignees ?? []).flatMap((assignee) => {
+      const login = trimmed(assignee.login);
+      return login === null ? [] : [login];
+    }),
     labels: toLabels(raw.labels),
     checksState: rollupChecksState(raw.statusCheckRollup),
   };
@@ -1733,6 +1749,9 @@ export function decodePullRequestSearchJson(
           const login = trimmed(request?.requestedReviewer?.login);
           return login === null ? [] : [{ login }];
         }),
+        assignees: (node.assignees?.nodes ?? []).flatMap((assignee) =>
+          assignee === null ? [] : [assignee],
+        ),
         labels: (node.labels?.nodes ?? []).flatMap((label) => (label === null ? [] : [label])),
         // The search asks for the verdict rather than the checks behind it, so it arrives as one
         // enum. Dressed as a single check here so the rollup is read the same way on both paths.

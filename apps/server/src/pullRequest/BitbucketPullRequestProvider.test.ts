@@ -129,6 +129,28 @@ it.effect("reads checks and PR state without diff, mergeability, or permission r
   }),
 );
 
+it.effect("answers an assigned listing with nothing, without asking the host", () =>
+  Effect.gen(function* () {
+    // listPullRequests is left unimplemented, so reaching the host would die instead.
+    const provider = yield* make.pipe(
+      Effect.provide(Layer.mock(BitbucketPullRequestApi.BitbucketPullRequestApi)({})),
+    );
+
+    const page = yield* provider.listChangeRequests({
+      cwd: "/repo",
+      repository: "acme/web",
+      host: "bitbucket.org",
+      state: "open",
+      involvement: "assigned",
+      viewer: "bilal",
+      limit: 10,
+    });
+
+    expect(page.items).toEqual([]);
+    expect(page.truncated).toBe(false);
+  }),
+);
+
 describe("bitbucketProviderFailure", () => {
   it("treats only an HTTP 401 as unusable credentials", () => {
     const responseError = (status: number) =>

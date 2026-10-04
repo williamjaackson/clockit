@@ -25,6 +25,7 @@ import {
   decodeViewerPermissionsJson,
   decodeWorkflowRunApprovalsJson,
   reviewThreadConversation,
+  PULL_REQUEST_LIST_JSON_FIELDS,
   REVIEW_THREADS_GRAPHQL_QUERY,
   pullRequestCoreGraphQlQuery,
   pullRequestSearchGraphQlQuery,
@@ -79,6 +80,25 @@ describe("pull request list decoding", () => {
       ),
     ).items;
     expect(entry?.reviewRequestLogins).toEqual(["octocat"]);
+  });
+
+  it("reads assignees apart from review requests, and none where GitHub sent none", () => {
+    // `--json` only answers the fields it was asked for.
+    expect(PULL_REQUEST_LIST_JSON_FIELDS.split(",")).toContain("assignees");
+    const batch = expectSuccess(
+      decodePullRequestListJson(
+        listJson([
+          {
+            assignees: [{ login: "Bilal", name: "Bilal", id: "U_1" }, { login: "hubot" }],
+            reviewRequests: [{ login: "octocat" }],
+          },
+          { reviewRequests: [{ login: "bilal" }] },
+          { assignees: [] },
+        ]),
+      ),
+    );
+    expect(batch.items.map((entry) => entry.assigneeLogins)).toEqual([["Bilal", "hubot"], [], []]);
+    expect(batch.items[0]?.reviewRequestLogins).toEqual(["octocat"]);
   });
 
   it("normalizes the review decision and reports nothing for one GitHub does not summarize", () => {
@@ -241,6 +261,21 @@ describe("pull request search decoding", () => {
       "pending",
       null,
     ]);
+  });
+
+  it("flattens the assignee connection apart from review requests", () => {
+    expect(pullRequestSearchGraphQlQuery(20)).toMatch(/assignees\(first: \d+\) \{ nodes \{ login/);
+    const raw = JSON.parse(searchJson([null, null]));
+    raw.data.search.nodes[0].assignees = { nodes: [{ login: "Bilal" }, null, { login: "hubot" }] };
+    raw.data.search.nodes[0].reviewRequests = {
+      nodes: [{ requestedReviewer: { login: "octocat" } }],
+    };
+    raw.data.search.nodes[1].reviewRequests = {
+      nodes: [{ requestedReviewer: { login: "bilal" } }],
+    };
+    const batch = expectSuccess(decodePullRequestSearchJson(JSON.stringify(raw)));
+    expect(batch.items.map((entry) => entry.assigneeLogins)).toEqual([["Bilal", "hubot"], []]);
+    expect(batch.items[0]?.reviewRequestLogins).toEqual(["octocat"]);
   });
 });
 

@@ -40,7 +40,7 @@ export interface EnvironmentPullRequestError extends PullRequestListProjectError
   readonly environmentId: EnvironmentId;
 }
 
-export type PullRequestGroupKey = "reviewRequested" | "authored" | "others";
+export type PullRequestGroupKey = "assigned" | "reviewRequested" | "authored" | "others";
 
 export interface PullRequestGroup<Entry extends PullRequestListEntry = PullRequestListEntry> {
   readonly key: PullRequestGroupKey;
@@ -73,6 +73,7 @@ const pullRequestViewerKey = (entry: ScopedEntry): string =>
   `${entry.environmentId ?? ""} ${entry.host}`;
 
 const GROUP_LABELS: Record<PullRequestGroupKey, string> = {
+  assigned: "Assigned to you",
   reviewRequested: "Review requested",
   authored: "Authored",
   others: "Others",
@@ -322,20 +323,24 @@ export function matchesPullRequestQuery(entry: PullRequestListEntry, query: stri
 
 /**
  * The server returns the involvement superset for a state, so switching between the Reviewing
- * and Authored tabs never waits on the network.
+ * and Authored tabs never waits on the network. Authored keeps every one of the viewer's own pull
+ * requests, whoever they are assigned to.
  */
 export function filterPullRequestsByInvolvement<Entry extends ScopedEntry>(
   entries: ReadonlyArray<Entry>,
   viewers: PullRequestViewers,
   involvement: PullRequestInvolvement,
 ): ReadonlyArray<Entry> {
-  if (involvement === "reviewing") {
-    return entries.filter((entry) => entry.viewerReviewRequested);
+  switch (involvement) {
+    case "reviewing":
+      return entries.filter((entry) => entry.viewerReviewRequested);
+    case "authored":
+      return entries.filter((entry) => isAuthoredByViewer(entry, viewers));
+    case "assigned":
+      return entries.filter((entry) => entry.viewerAssigned === true);
+    case "all":
+      return entries;
   }
-  if (involvement === "authored") {
-    return entries.filter((entry) => isAuthoredByViewer(entry, viewers));
-  }
-  return entries;
 }
 
 /**
@@ -400,19 +405,24 @@ export function matchesPullRequestFilters(
 
 /**
  * Only relationships the list data actually carries: no "previously reviewed" bucket is
- * inferred, because the listing has no review history.
+ * inferred, because the listing has no review history. Each row is filed once, under the first of
+ * assigned, authored and review requested that holds: an assignment is how work is handed over,
+ * so it outranks who opened the pull request.
  */
 export function groupPullRequestsByInvolvement<Entry extends ScopedEntry>(
   entries: ReadonlyArray<Entry>,
   viewers: PullRequestViewers,
 ): ReadonlyArray<PullRequestGroup<Entry>> {
   const buckets: Record<PullRequestGroupKey, Entry[]> = {
+    assigned: [],
     reviewRequested: [],
     authored: [],
     others: [],
   };
   for (const entry of entries) {
-    if (isAuthoredByViewer(entry, viewers)) {
+    if (entry.viewerAssigned === true) {
+      buckets.assigned.push(entry);
+    } else if (isAuthoredByViewer(entry, viewers)) {
       buckets.authored.push(entry);
     } else if (entry.viewerReviewRequested) {
       buckets.reviewRequested.push(entry);
@@ -420,7 +430,7 @@ export function groupPullRequestsByInvolvement<Entry extends ScopedEntry>(
       buckets.others.push(entry);
     }
   }
-  return (["authored", "reviewRequested", "others"] as const)
+  return (["assigned", "authored", "reviewRequested", "others"] as const)
     .filter((key) => buckets[key].length > 0)
     .map((key) => ({ key, label: GROUP_LABELS[key], entries: buckets[key] }));
 }
@@ -592,41 +602,65 @@ export function retainVisiblePullRequestStatsBatches(
  * The priority groups built from the hosts' own answers rather than re-partitioned from the
  * paginated feed. The feed is sliced by recency, so an older authored or review-requested row
  * can be missing from its first page and arrive with a later one; grouping the loaded pages
- * would then move it above rows already read. Here the partitions come whole from their own
- * server-filtered reads, the feed fills "Others" in its own order, and a continuation can only
- * append — a row it carries that a partition already holds is dropped rather than moved.
+ * would then move it above rows already read. Here the authored and review-requested groups come
+ * from their own server-filtered reads, the feed fills "Others" in its own order, and a
+ * continuation can only append: a row it carries that one of those reads already holds is dropped
+ * rather than moved.
+ *
+ * Assigned is the exception. Assignment is how work changes hands, so a row is filed there by the
+ * assignment flag on its freshest copy from any read, and a feed row assigned since the assigned
+ * read answered moves up into it.
  */
 export function partitionPullRequestsWithPriority<Entry extends PullRequestListEntry>(
   entries: ReadonlyArray<Entry>,
   authored: ReadonlyArray<Entry>,
   reviewRequested: ReadonlyArray<Entry>,
+  assigned: ReadonlyArray<Entry> = [],
 ): ReadonlyArray<PullRequestGroup<Entry>> {
-  const authoredByKey = new Map(authored.map((entry) => [pullRequestEntryKey(entry), entry]));
-  // A row can be both authored and review-requested; authored wins, as the local grouping has it.
-  const reviewByKey = new Map(
-    reviewRequested.flatMap((entry) => {
-      const key = pullRequestEntryKey(entry);
-      return authoredByKey.has(key) ? [] : [[key, entry] as const];
-    }),
-  );
-  const others: Entry[] = [];
+  // The feed goes last, so its copy wins unless another read's copy was observed later.
+  const freshest = new Map<string, Entry>();
+  for (const entry of [...assigned, ...authored, ...reviewRequested, ...entries]) {
+    const key = pullRequestEntryKey(entry);
+    const held = freshest.get(key)?.observedAt;
+    if (held === undefined || entry.observedAt === undefined || entry.observedAt >= held) {
+      freshest.set(key, entry);
+    }
+  }
+  const authoredKeys = new Set(authored.map(pullRequestEntryKey));
+  const reviewKeys = new Set(reviewRequested.map(pullRequestEntryKey));
+  const groups: Record<PullRequestGroupKey, Entry[]> = {
+    assigned: [],
+    authored: [],
+    reviewRequested: [],
+    others: [],
+  };
+  const groupOf = (key: string, entry: Entry): PullRequestGroupKey | undefined =>
+    entry.viewerAssigned === true
+      ? "assigned"
+      : authoredKeys.has(key)
+        ? "authored"
+        : reviewKeys.has(key)
+          ? "reviewRequested"
+          : undefined;
+  for (const [key, entry] of freshest) {
+    const group = groupOf(key, entry);
+    if (group !== undefined) groups[group].push(entry);
+  }
+  const filed = new Set<string>();
   for (const entry of entries) {
     const key = pullRequestEntryKey(entry);
-    // The feed's copy of a partitioned row is at least as fresh — it replaces in place.
-    if (authoredByKey.has(key)) {
-      authoredByKey.set(key, entry);
-    } else if (reviewByKey.has(key)) {
-      reviewByKey.set(key, entry);
-    } else {
-      others.push(entry);
-    }
+    const copy = freshest.get(key)!;
+    if (filed.has(key) || groupOf(key, copy) !== undefined) continue;
+    filed.add(key);
+    groups.others.push(copy);
   }
   const byRecency = (left: Entry, right: Entry) => right.updatedAt.localeCompare(left.updatedAt);
   return (
     [
-      { key: "authored", entries: [...authoredByKey.values()].toSorted(byRecency) },
-      { key: "reviewRequested", entries: [...reviewByKey.values()].toSorted(byRecency) },
-      { key: "others", entries: others },
+      { key: "assigned", entries: groups.assigned.toSorted(byRecency) },
+      { key: "authored", entries: groups.authored.toSorted(byRecency) },
+      { key: "reviewRequested", entries: groups.reviewRequested.toSorted(byRecency) },
+      { key: "others", entries: groups.others },
     ] as const
   )
     .filter((group) => group.entries.length > 0)
@@ -772,6 +806,8 @@ const snapshotStorageKey = (environmentSetKey: string) =>
 export interface PullRequestPartitionsSnapshot {
   readonly authored: ReadonlyArray<EnvironmentPullRequestEntry>;
   readonly reviewing: ReadonlyArray<EnvironmentPullRequestEntry>;
+  /** Absent from a snapshot written before the Assigned group existed. */
+  readonly assigned?: ReadonlyArray<EnvironmentPullRequestEntry> | undefined;
 }
 
 export interface PullRequestListSnapshot {
@@ -812,6 +848,7 @@ const decodeSnapshot = Schema.decodeUnknownOption(
       Schema.Struct({
         authored: Schema.Array(EnvironmentPullRequestEntrySchema),
         reviewing: Schema.Array(EnvironmentPullRequestEntrySchema),
+        assigned: Schema.optional(Schema.Array(EnvironmentPullRequestEntrySchema)),
       }),
     ),
   }),
@@ -864,6 +901,9 @@ export function writePullRequestListSnapshot(
               partitions: {
                 authored: snapshot.partitions.authored.slice(0, SNAPSHOT_MAX_ENTRIES),
                 reviewing: snapshot.partitions.reviewing.slice(0, SNAPSHOT_MAX_ENTRIES),
+                ...(snapshot.partitions.assigned === undefined
+                  ? {}
+                  : { assigned: snapshot.partitions.assigned.slice(0, SNAPSHOT_MAX_ENTRIES) }),
               },
             }),
       }),
@@ -1073,7 +1113,7 @@ export function rankPullRequestsBlockedOnReviewer<Entry extends PullRequestListE
   return rankByTierThenRecency(entries, (entry) => (entry.state === "open" ? 0 : 1));
 }
 
-/** Keeps authored work first while applying the selected ordering inside every involvement group. */
+/** Keeps the involvement groups in order while applying the selected ordering inside each. */
 export function sortPullRequestGroups<Entry extends PullRequestListEntry>(
   groups: ReadonlyArray<PullRequestGroup<Entry>>,
   sort: PullRequestListSort,
@@ -1091,16 +1131,32 @@ export function sortPullRequestGroups<Entry extends PullRequestListEntry>(
   }
   if (sort === "blocked") {
     if (searchText.trim().length > 0) return groups;
-    const role = (key: PullRequestGroupKey) =>
-      key === "others" ? involvement : key === "authored" ? "authored" : "reviewing";
+    // An assigned pull request is the viewer's to land, so it waits on them the way their own does.
+    const rankForInvolvement = (involvement: PullRequestInvolvement) => {
+      switch (involvement) {
+        case "authored":
+        case "assigned":
+          return rankPullRequestsBlockedOnAuthor;
+        case "reviewing":
+          return rankPullRequestsBlockedOnReviewer;
+        case "all":
+          return null;
+      }
+    };
+    const rankOf = (key: PullRequestGroupKey) => {
+      switch (key) {
+        case "assigned":
+        case "authored":
+          return rankPullRequestsBlockedOnAuthor;
+        case "reviewRequested":
+          return rankPullRequestsBlockedOnReviewer;
+        case "others":
+          return rankForInvolvement(involvement);
+      }
+    };
     return groups.map((group) => {
-      const groupRole = role(group.key);
-      if (groupRole === "all") return group;
-      const rank =
-        groupRole === "authored"
-          ? rankPullRequestsBlockedOnAuthor
-          : rankPullRequestsBlockedOnReviewer;
-      return { ...group, entries: rank(group.entries) };
+      const rank = rankOf(group.key);
+      return rank === null ? group : { ...group, entries: rank(group.entries) };
     });
   }
   if (sort === "updated") return groups;

@@ -370,6 +370,26 @@ layer("GitLabPullRequestCli.layer", (it) => {
     }),
   );
 
+  it.effect("filters by the assignee, and only the assignee, when assigned", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output("[]")));
+      const cli = yield* GitLabPullRequestCli.GitLabPullRequestCli;
+
+      yield* cli.listMergeRequests({
+        cwd: "/w",
+        repository: "acme/web",
+        state: "open",
+        involvement: "assigned",
+        viewer: "bilal",
+        limit: 10,
+      });
+
+      expect(argsOfCall(0)[1]).toContain("assignee_username=bilal");
+      expect(argsOfCall(0)[1]).not.toContain("reviewer_username");
+      expect(argsOfCall(0)[1]).not.toContain("author_username");
+    }),
+  );
+
   it.effect("addresses a nested group project by its encoded full path", () =>
     Effect.gen(function* () {
       mockedExecute.mockReturnValueOnce(Effect.succeed(output("[]")));

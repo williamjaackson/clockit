@@ -908,6 +908,50 @@ layer("GitHubPullRequestCli.layer", (it) => {
     }),
   );
 
+  it.effect("narrows to the assignee on the assigned tab, and to nothing else", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValue(Effect.succeed(output("[]")));
+      const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+
+      yield* cli.listPullRequests({
+        cwd: "/w",
+        repository: "acme/web",
+        host: "github.com",
+        state: "open",
+        involvement: "assigned",
+        viewer: "bilal",
+        limit: 10,
+      });
+
+      const args = callAt(0).args;
+      expect(args[args.indexOf("--assignee") + 1]).toBe("bilal");
+      expect(args).not.toContain("--author");
+      expect(searchOfCall(0)).toBe("sort:updated-desc");
+    }),
+  );
+
+  it.effect("narrows a search to the assignee", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValue(Effect.succeed(searchPage([])));
+      const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+
+      yield* cli.searchPullRequests({
+        cwd: "/w",
+        host: "github.com",
+        repositories: ["acme/web"],
+        state: "open",
+        involvement: "assigned",
+        viewer: "bilal",
+        limit: 10,
+      });
+
+      assert.strictEqual(
+        searchQueryOfCall(0),
+        "is:pr is:open assignee:bilal sort:updated-desc repo:acme/web",
+      );
+    }),
+  );
+
   it.effect("carries every repository and every qualifier into one search", () =>
     Effect.gen(function* () {
       mockedExecute.mockReturnValue(Effect.succeed(searchPage([])));
@@ -1679,6 +1723,42 @@ layer("GitHubPullRequestCli.layer", (it) => {
       expect(batch.items.map((item) => item.number)).toEqual([1, 2]);
       expect(searchOfCall(1)).toBeUndefined();
       assert.isFalse(batch.continues);
+    }),
+  );
+
+  it.effect("keeps only the viewer's assignments on the search-free fallback", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output("[]")));
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed(
+          output(
+            pullRequests(4, 1, (number) =>
+              number === 1
+                ? { assignees: [{ login: "Bilal" }] }
+                : number === 2
+                  ? // Asked to review is not assigned.
+                    { reviewRequests: [{ login: "bilal" }] }
+                  : number === 3
+                    ? { author: { login: "bilal" }, assignees: [{ login: "hubot" }] }
+                    : { assignees: [{ login: "hubot" }, { login: "bilal" }] },
+            ),
+          ),
+        ),
+      );
+      const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+
+      const batch = yield* cli.listPullRequests({
+        cwd: "/w",
+        repository: "acme/web",
+        host: "github.com",
+        state: "open",
+        involvement: "assigned",
+        viewer: "bilal",
+        limit: 10,
+      });
+
+      expect(batch.items.map((item) => item.number)).toEqual([1, 4]);
+      expect(searchOfCall(1)).toBeUndefined();
     }),
   );
 
