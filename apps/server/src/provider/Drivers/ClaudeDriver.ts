@@ -44,6 +44,10 @@ import {
   probeClaudeWorkspaceSnapshot,
 } from "../Layers/ClaudeProvider.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
+import {
+  resolveCatalogSkillOverlay,
+  skillOverlayResolverFromContext,
+} from "../ProviderSkillOverlay.ts";
 import * as ModelManifest from "../ModelManifest.ts";
 import { resolveClaudeModelCatalog } from "../ClaudeModelCatalog.ts";
 import {
@@ -165,6 +169,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       });
 
       const scopedLimitNames = yield* makeClaudeScopedLimitNames;
+      const resolveSkillOverlay = yield* skillOverlayResolverFromContext;
       const orchestrationAdapter = yield* createClaudeAdapterV2(
         {
           instanceId,
@@ -174,7 +179,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
           enabled,
           config,
         },
-        { scopedLimitNames, onUsageLimits: (update) => snapshot.applyUsageLimits(update) },
+        {
+          scopedLimitNames,
+          onUsageLimits: (update) => snapshot.applyUsageLimits(update),
+          ...(resolveSkillOverlay === undefined ? {} : { resolveSkillOverlay }),
+        },
       ).pipe(
         Effect.mapError(
           (cause) =>
@@ -348,10 +357,20 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         snapshot,
         invalidateCaches: Cache.invalidateAll(capabilitiesProbeCache),
         snapshotForCwd: (cwd: string) =>
-          snapshot.getSnapshot.pipe(
-            Effect.flatMap((machineSnapshot) =>
-              probeClaudeWorkspaceSnapshot(effectiveConfig, machineSnapshot, cwd, processEnv),
-            ),
+          Effect.gen(function* () {
+            const machineSnapshot = yield* snapshot.getSnapshot;
+            const skillOverlay = yield* resolveCatalogSkillOverlay(resolveSkillOverlay, cwd, {
+              driver: DRIVER_KIND,
+              instanceId,
+            });
+            return yield* probeClaudeWorkspaceSnapshot(
+              effectiveConfig,
+              machineSnapshot,
+              cwd,
+              processEnv,
+              skillOverlay,
+            );
+          }).pipe(
             Effect.provideService(FileSystem.FileSystem, fileSystem),
             Effect.provideService(Path.Path, path),
           ),

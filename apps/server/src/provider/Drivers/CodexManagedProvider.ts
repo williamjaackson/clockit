@@ -15,6 +15,11 @@ import {
   probeCodexSkillsForCwd,
 } from "../Layers/CodexProvider.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
+import {
+  applySkillOverlayToCatalog,
+  resolveCatalogSkillOverlay,
+  skillOverlayResolverFromContext,
+} from "../ProviderSkillOverlay.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import { type ProviderDriverCreateInput, type ProviderInstance } from "../ProviderDriver.ts";
 import { codexContinuationIdentity } from "./CodexHomeLayout.ts";
@@ -217,9 +222,11 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
   const resolveRuntime = runtime.auth.controller.withAccess!(runtime.resolve);
   // Launch settings resolve per session from the signed-in token. The registry
   // already wraps openSession in withAccess, so resolve without re-entering it.
+  const resolveSkillOverlay = yield* skillOverlayResolverFromContext;
   const orchestrationAdapter = yield* createCodexAdapterV2(input, {
     onUsageLimits: (update) => snapshot.applyUsageLimits(update),
     resolveRuntime: runtime.resolve,
+    ...(resolveSkillOverlay === undefined ? {} : { resolveSkillOverlay }),
   }).pipe(
     Effect.mapError(
       (cause) =>
@@ -271,22 +278,31 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
     auth: runtime.auth.controller,
     snapshotForCwd: (cwd: string) =>
       enabled
-        ? resolveRuntime.pipe(
-            Effect.flatMap((effective) =>
-              probeCodexSkillsForCwd({
-                binaryPath: effective.config.binaryPath,
-                homePath: effective.config.homePath,
-                launchArgs: effective.config.launchArgs,
-                cwd,
-                environment: effective.environment,
-              }),
+        ? resolveCatalogSkillOverlay(resolveSkillOverlay, cwd, { driver: DRIVER, instanceId }).pipe(
+            Effect.flatMap((skillOverlay) =>
+              resolveRuntime.pipe(
+                Effect.flatMap((effective) =>
+                  probeCodexSkillsForCwd({
+                    binaryPath: effective.config.binaryPath,
+                    homePath: effective.config.homePath,
+                    launchArgs: effective.config.launchArgs,
+                    cwd,
+                    environment: effective.environment,
+                  }),
+                ),
+                Effect.flatMap((skills) =>
+                  snapshot.getSnapshot.pipe(
+                    Effect.map((draft) => ({
+                      ...draft,
+                      skills: applySkillOverlayToCatalog(skills, skillOverlay, "codex"),
+                    })),
+                  ),
+                ),
+                Effect.scoped,
+                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                Effect.catch(() => snapshot.getSnapshot),
+              ),
             ),
-            Effect.flatMap((skills) =>
-              snapshot.getSnapshot.pipe(Effect.map((draft) => ({ ...draft, skills }))),
-            ),
-            Effect.scoped,
-            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-            Effect.catch(() => snapshot.getSnapshot),
           )
         : snapshot.getSnapshot,
   } satisfies ProviderInstance;
